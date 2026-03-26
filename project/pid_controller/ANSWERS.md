@@ -30,6 +30,16 @@
 
 ## 1. Plot Description
 
+### Step 1 — Vehicle Spawned (PID not yet active)
+
+The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town10HD_Opt, stationary before the PID controller begins issuing commands:
+
+![Vehicle spawned in CARLA — stationary](../screenshot.png)
+
+---
+
+### Step 4 — PID Performance Plots
+
 The plots below capture **152 control iterations** (~3 minutes of driving) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
 
 ![PID Performance Plots](../pid_plots.png)
