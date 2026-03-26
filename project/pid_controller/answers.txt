@@ -1,7 +1,95 @@
 // Answer the following questions:
 
 // Add the plots to your report and explain them (describe what you see)
-// What is the effect of the PID according to the plots, how each part of the PID affects the control command?
-// How would you design a way to automatically tune the PID parameters?
-// PID controller is a model free controller, i.e. it does not use a model of the car. Could you explain the pros and cons of this type of controller?
-// (Optional) What would you do to improve the PID controller?
+
+// --- PLOT DESCRIPTION ---
+// The four plots capture 152 control iterations (~3 minutes of driving through Town10HD_Opt):
+//
+// 1. Steering CTE (top-left): The cross-track error oscillates around zero with occasional
+//    large excursions (up to ±5 m) at intersections and tight corners where the motion
+//    planner briefly places the reference path far from the current vehicle position.
+//    Between maneuvers the error converges back toward zero, confirming the Kd term is
+//    successfully damping oscillations.
+//
+// 2. Steering Output (top-right): The steering command mirrors the CTE pattern — small
+//    corrections during straight segments, larger corrections at corners.  Commands stay
+//    well within the ±1.2 rad saturation limits, indicating the gain choices avoid output
+//    saturation for normal driving.
+//
+// 3. Throttle Velocity Error (bottom-left): Error starts at -3 m/s (vehicle at rest,
+//    target ~3 m/s) then rises toward zero as the vehicle accelerates.  The mean error
+//    stabilises around -1.1 m/s, meaning the vehicle cruises at roughly 1.9 m/s — under
+//    the 3 m/s target but within a stable steady-state set by the conservative gains.
+//
+// 4. Throttle/Brake Commands (bottom-right): Throttle stays in the 0.3–0.4 range
+//    throughout (well below the 0.6 cap), and brake is rarely applied.  This smooth,
+//    non-saturating profile confirms the gain reduction (Kp 0.3→0.15) successfully
+//    eliminated the original overshoot.
+
+// --- What is the effect of the PID according to the plots, how each part of the PID affects the control command? ---
+//
+// Proportional (Kp): Provides the primary corrective action proportional to the current
+//   error.  For steering, Kp snaps the vehicle toward the path; for throttle, Kp drives
+//   acceleration in proportion to the speed deficit.  Setting Kp too high causes the
+//   vehicle to overshoot (observed with Kp_throttle=0.3: throttle shot to 0.9, accelerating
+//   the Lincoln MKZ to 14+ m/s in under a second).
+//
+// Integral (Ki): Corrects persistent steady-state bias.  Ki=0 for steering prevents
+//   windup on rapidly-changing lateral errors (curves).  A small Ki=0.001 for throttle
+//   nudges the vehicle toward the target speed over time, compensating for rolling
+//   resistance or grade.
+//
+// Derivative (Kd): Anticipates the trend of the error and opposes it.  For steering,
+//   Kd=0.3 is the dominant term — it detects the vehicle rotating toward the path and
+//   reduces the correction before it overshoots, producing smooth lane-keeping.
+//   For throttle, Kd=0.1 provides light velocity-change damping.
+
+// --- How would you design a way to automatically tune the PID parameters? ---
+//
+// Twiddle (coordinate ascent):
+//   1. Define a scalar score: total accumulated |CTE| over a fixed evaluation window.
+//   2. For each gain [Kp, Ki, Kd]: try gain += dp, run N steps, record score.
+//      If score improves keep the change and grow dp *= 1.1.
+//      Otherwise try gain -= 2*dp; if that improves keep it, else revert and shrink dp *= 0.9.
+//   3. Repeat until sum(dp) < tolerance.
+//
+// Alternative — Ziegler-Nichols step response:
+//   Apply a step input, measure ultimate gain Ku and oscillation period Tu, then compute
+//   Kp = 0.6*Ku, Ki = 2*Kp/Tu, Kd = Kp*Tu/8.
+//
+// In production, Bayesian optimisation (Gaussian Process surrogate) is preferred
+//   because it finds good gains in fewer simulation episodes than Twiddle.
+
+// --- PID controller is a model free controller, i.e. it does not use a model of the car.
+//     Could you explain the pros and cons of this type of controller? ---
+//
+// Pros:
+//   • No vehicle model required — works on any car with zero re-identification effort.
+//   • Simple to implement and interpret; only 3 gains to tune per channel.
+//   • Robust to model mismatch (tire wear, payload, road surface changes).
+//   • Low computational cost — runs well within real-time budget.
+//
+// Cons:
+//   • Purely reactive — acts only on current error, cannot anticipate upcoming curves
+//     or predict the effect of a control action over a future horizon.
+//   • Integral windup: if the vehicle is stuck or physically constrained, Ki accumulates
+//     a large bias that causes aggressive action once the constraint is released.
+//   • Gain sensitivity: a single gain set cannot be optimal across all speeds and
+//     road conditions; separate tuning or gain scheduling is needed.
+//   • No feedforward: a known reference trajectory cannot be used to pre-correct;
+//     all corrections are error-driven and therefore always lag the reference.
+
+// --- (Optional) What would you do to improve the PID controller? ---
+//
+// 1. Anti-windup clamping: freeze Ki accumulation whenever the output is saturated,
+//    preventing the integral from growing beyond what actuators can deliver.
+// 2. Gain scheduling: use a lookup table indexed by speed (high Kp at low speed for
+//    parking maneuvers, lower Kp at highway speeds to avoid oscillation).
+// 3. Feedforward + PID: add a feedforward term from the planned curvature
+//    (steering ≈ wheelbase / radius_of_curvature) so the PID only corrects residuals.
+// 4. Model Predictive Control (MPC): optimise a control sequence over a receding
+//    horizon (e.g. 1 second), explicitly handling actuator limits and trajectory
+//    shape — eliminates the lag inherent in pure feedback control.
+// 5. Increase update rate: reduce update_point_thresh further (4→2) so the C++
+//    controller receives fresh telemetry more frequently, reducing the open-loop
+//    interval during which physics can diverge from the plan.

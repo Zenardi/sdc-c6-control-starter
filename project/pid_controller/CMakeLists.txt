@@ -3,47 +3,51 @@ project(PidController)
 cmake_minimum_required (VERSION 3.10)
 
 # -g allows for gdb debugging
-# turn on -03 for best performance
-add_definitions(-std=c++14 -O3)
+# turn on -O3 for best performance
+add_definitions(-std=c++17 -O3)
 
 set(CXX_FLAGS "-pthread -fPIC -DNDEBUG -Wall -Wextra")
-set(CMAKE_CXX_FLAGS "${CXX_FLAGS} -Wl,-Bstatic -lcarla_client -lrpc -lboost_filesystem -Wl,-Bdynamic")
+set(CMAKE_CXX_FLAGS "${CXX_FLAGS}")
 
 set(sources main.cpp behavior_planner_FSM.cpp motion_planner.cpp cubic_spiral.cpp spiral_base.cpp integral.cpp spiral_equations.cpp cost_functions.cpp utils.cpp velocity_profile_generator.cpp pid_controller.cpp)
 
-# Use includes and libs from CARLA_SOURCE_DIR.
-set(CARLA_SOURCE_DIR /opt/carla-source)
-set(CARLA_BUILD_DIR ${CARLA_SOURCE_DIR}/Build)
-set(CARLA_BUILD_BOOST_DIR ${CARLA_BUILD_DIR}/boost-1.72.0-c8-install)
-set(CARLA_BUILD_RECAST_DIR ${CARLA_BUILD_DIR}/recast-cdce4e-c8-install)
-set(CARLA_BUILD_RPCLIB_DIR ${CARLA_BUILD_DIR}/rpclib-v2.2.1_c2-c8-libstdcxx-install)
+# ---------------------------------------------------------------------------
+# Local CARLA stub headers (replaces /opt/carla-source which is not present).
+# project/CARLA is a binary-only 0.9.16 install; the C++ client SDK is not
+# included.  We provide minimal stubs for the types actually used at compile
+# time.  The runtime communication is WebSocket (uWS) via simulatorAPI.py.
+# ---------------------------------------------------------------------------
+set(LOCAL_CARLA_STUBS_DIR ${CMAKE_CURRENT_SOURCE_DIR})  # carla/ lives here
 
-set(CARLA_BUILD_LIBCARLA_DIR ${CARLA_BUILD_DIR}/libcarla-client-build.release/LibCarla/cmake/client)
-set(CARLA_BUILD_BOOST_LIB_DIR ${CARLA_BUILD_BOOST_DIR}/lib)
-set(CARLA_BUILD_RECAST_LIB_DIR ${CARLA_BUILD_RECAST_DIR}/lib)
-set(CARLA_BUILD_RPCLIB_LIB_DIR ${CARLA_BUILD_RPCLIB_DIR}/lib)
+# rpc library bundled with the local CARLA binary install
+set(CARLA_RPC_LIB
+    ${CMAKE_CURRENT_SOURCE_DIR}/../CARLA/CarlaUE4/Plugins/Carla/CarlaDependencies/lib/librpc.a)
 
-set(carla_libs ${CARLA_BUILD_BOOST_LIB_DIR}/libboost_filesystem.a ${CARLA_BUILD_BOOST_LIB_DIR}/libboost_program_options.a ${CARLA_BUILD_BOOST_LIB_DIR}/libboost_python38.a ${CARLA_BUILD_BOOST_LIB_DIR}/libboost_system.a ${CARLA_BUILD_LIBCARLA_DIR}/libcarla_client.a ${CARLA_BUILD_RPCLIB_LIB_DIR}/librpc.a ${CARLA_BUILD_RECAST_LIB_DIR}/libDebugUtils.a ${CARLA_BUILD_RECAST_LIB_DIR}/libDetour.a ${CARLA_BUILD_RECAST_LIB_DIR}/libDetourCrowd.a ${CARLA_BUILD_RECAST_LIB_DIR}/libDetourTileCache.a ${CARLA_BUILD_RECAST_LIB_DIR}/libRecast.a)
+# System Boost 1.88 (installed via apt libboost-all-dev)
+set(BOOST_INCLUDE_DIR /usr/include)
+set(BOOST_LIB_DIR     /usr/lib/x86_64-linux-gnu)
 
-include_directories(/usr/local/include)
-link_directories(/usr/local/lib)
+# uWS is installed system-wide at /usr/include/uWS and /usr/lib/libuWS.so
+include_directories(/usr/include)
+link_directories(/usr/lib)
 
 include_directories(eigen-3.3.7)
+include_directories(${LOCAL_CARLA_STUBS_DIR})
+include_directories(${BOOST_INCLUDE_DIR})
 
-include_directories(${CARLA_SOURCE_DIR}/LibCarla/source)
-include_directories(${CARLA_BUILD_BOOST_DIR}/include)
-include_directories(${CARLA_BUILD_RECAST_DIR}/include)
-include_directories(${CARLA_BUILD_RPCLIB_DIR}/include)
-
-link_directories(${CARLA_BUILD_LIBCARLA_DIR})
-link_directories(${CARLA_BUILD_BOOST_LIB_DIR})
-link_directories(${CARLA_BUILD_RECAST_LIB_DIR})
-link_directories(${CARLA_BUILD_RPCLIB_LIB_DIR})
+link_directories(${BOOST_LIB_DIR})
 
 if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 
 endif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 
-add_executable(pid_controller ${sources} )
+add_executable(pid_controller ${sources})
 
-target_link_libraries(pid_controller z ssl uv uWS ${carla_libs} gtest glog boost_filesystem lapack)
+target_link_libraries(pid_controller
+    z ssl uWS
+    ${CARLA_RPC_LIB}
+    gtest glog
+    boost_filesystem boost_system boost_program_options
+    lapack
+)
+

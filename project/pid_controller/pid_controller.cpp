@@ -16,29 +16,56 @@ PID::PID() {}
 PID::~PID() {}
 
 void PID::Init(double Kpi, double Kii, double Kdi, double output_lim_maxi, double output_lim_mini) {
-   /**
-   * TODO: Initialize PID coefficients (and errors, if needed)
-   **/
+    // Store gains and output clamp limits
+    _kpi = Kpi;
+    _kii = Kii;
+    _kdi = Kdi;
+    _output_lim_maxi = output_lim_maxi;
+    _output_lim_mini = output_lim_mini;
+
+    // Initialise all error accumulators to zero
+    _p_error = 0.0;
+    _i_error = 0.0;
+    _d_error = 0.0;
+    _new_delta_time = 0.0;
 }
 
 
 void PID::UpdateError(double cte) {
-   /**
-   * TODO: Update PID errors based on cte.
-   **/
+    // Save previous proportional error to compute derivative
+    double previous_p_error = _p_error;
+
+    // P error: current cross-track error
+    _p_error = cte;
+
+    // Guard: use dt=1 on first call (delta_time not yet set) to avoid divide-by-zero
+    double dt = (_new_delta_time > 0.0) ? _new_delta_time : 1.0;
+
+    // D error: rate of change of CTE (smooths correction, reduces overshoot)
+    _d_error = (cte - previous_p_error) / dt;
+
+    // I error: accumulated CTE * dt (corrects persistent steady-state offset)
+    _i_error += cte * dt;
 }
 
 double PID::TotalError() {
-   /**
-   * TODO: Calculate and return the total error
-    * The code should return a value in the interval [output_lim_mini, output_lim_maxi]
-   */
-    double control;
+    // PID output: negative signs because the controller opposes the error
+    double control = (-_kpi * _p_error)
+                   - (_kii * _i_error)
+                   - (_kdi * _d_error);
+
+    // Clamp output to actuator limits
+    if (control > _output_lim_maxi) {
+        control = _output_lim_maxi;
+    } else if (control < _output_lim_mini) {
+        control = _output_lim_mini;
+    }
+
     return control;
 }
 
 double PID::UpdateDeltaTime(double new_delta_time) {
-   /**
-   * TODO: Update the delta time with new value
-   */
+    // Store elapsed time for use in UpdateError's derivative/integral terms
+    _new_delta_time = new_delta_time;
+    return 0;  // return value is not used by main.cpp
 }

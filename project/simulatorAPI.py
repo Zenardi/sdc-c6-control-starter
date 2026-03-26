@@ -342,7 +342,7 @@ class World(object):
                 print('There are no spawn points available in your map/town.')
                 print('Please add some Vehicle Spawn Point to your UE4 scene.')
                 sys.exit(1)
-            spawn_point = self.map.get_spawn_points()[1]
+            spawn_point = self.map.get_spawn_points()[4]
             #print(len(spawn_points))
             #spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
             self.player = self.world.try_spawn_actor(blueprint, spawn_point)
@@ -785,24 +785,30 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
 
     return SpawnActor(blueprint, actor_spawn)
 
-@asyncio.coroutine
-def game_loop(args):
-    global update_cycle
+async def game_loop(args):
+    global update_cycle, _prev_yaw
+    import sys
+    print("[TRACE] game_loop starting", flush=True)
     pygame.init()
     pygame.font.init()
+    print("[TRACE] pygame init done", flush=True)
     world = None
     vehicles_list = []
 
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(2.0)
+        print("[TRACE] CARLA client created", flush=True)
 
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
+        print("[TRACE] pygame display created", flush=True)
 
         hud = HUD(args.width, args.height)
+        print("[TRACE] HUD created", flush=True)
         world = World(client.get_world(), hud, args)
+        print("[TRACE] World created, player:", world.player, flush=True)
         controller = KeyboardControl(world)
 
         clock = pygame.time.Clock()
@@ -827,7 +833,7 @@ def game_loop(args):
 #         forward_speed = measurement_data.player_measurements.forward_speed
 
         while True:
-            yield from asyncio.sleep(0.01) # check if any data from the websocket
+            await asyncio.sleep(0.01) # check if any data from the websocket
 
             if controller.parse_events(client, world):
                 return
@@ -836,7 +842,7 @@ def game_loop(args):
                 player = world.player.get_transform()
                 way_points.append(player)
                 v_points.append(0)
-
+                _prev_yaw = player.rotation.yaw * math.pi / 180  # seed with actual vehicle heading
 
             sim_time = world.hud.simulation_time - start_time
 
@@ -951,10 +957,9 @@ def get_data():
     update_cycle = True
 
 
-@asyncio.coroutine
-def ws_event(loop):
+async def ws_event():
     while True:
-        yield from loop.run_in_executor(None, get_data)
+        await asyncio.get_event_loop().run_in_executor(None, get_data)
 
 def main():
     argparser = argparse.ArgumentParser(
@@ -1012,13 +1017,9 @@ def main():
 
     #sio.connect('http://localhost:4567')
 
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(
-        asyncio.wait([
-            ws_event(loop),
-            game_loop(args)
-        ])
-    )
+    async def _run():
+        await asyncio.gather(ws_event(), game_loop(args))
+    asyncio.run(_run())
 
 if __name__ == '__main__':
 
