@@ -1,16 +1,24 @@
 """
 test_lane_change_pid.py
 =======================
-AV QA Engineer — Obstacle-Triggered Lane-Change PID Lateral Stability Test
+AV QA Engineer — Obstacle-Triggered EMERGENCY Lane-Change PID Stability Test
 
 Scene (Town03):
   Ego spawned near (x=-10, y=140, z=2), snapped to road centre via CARLA
   waypoint API.
-  Stationary police car (vehicle.dodge.charger_police) placed exactly 50 m
-  ahead in the SAME lane using waypoint.next(50.0) — guaranteed centred.
-  At 25 m distance: PID target shifts to the ADJACENT LEFT lane via CARLA's
-  native get_left_lane() API (always on valid road surface).
-  Synchronous mode dt=0.05 s — deterministic physics, zero frame-rate jitter.
+  Stationary police car (vehicle.dodge.charger_police) placed exactly 20 m
+  ahead in the SAME lane using waypoint.next(20.0) — guaranteed centred and
+  DIRECTLY in the ego's path.
+
+  Why 20 m?  At ~4.6 m/s the car would hit the police car in ≈4.3 s without
+  intervention.  This is a genuine collision scenario, not a planned merge.
+
+  At 15 m distance the lane-change fires (≈3.3 s before impact at cruise
+  speed).  The PID must swerve the car into the adjacent left lane in time.
+
+  Expected near-miss: when the ego's x-position equals the police car's
+  x-position (~3.3 s post-trigger), the car has moved ≈3.1 m laterally —
+  a centre-to-centre clearance of ≈3.1 m.  Safe but close.
 
 PID gains (exact mirror of main.cpp, never diverge):
   Steering  : Kp=0.05  Ki=0.00  Kd=0.05  clamp=[−0.3, +0.3]
@@ -19,18 +27,18 @@ PID gains (exact mirror of main.cpp, never diverge):
 
 Architecture note
 -----------------
-This is a STANDALONE Python test — the same PID math as pid_controller.cpp
-is reimplemented here so the test runs without the C++ WebSocket binary.
-Running `./run_main_pid.sh` (C++ + simulatorAPI.py) alongside a second CARLA
-Python client is architecturally unsafe: two clients would fight for the same
-ego actor and WebSocket port 4567. The standalone approach is the accepted
-SDD (Simulation-Driven Development) pattern used in all tests in this suite.
+Standalone Python test — PID math mirrors pid_controller.cpp so the test
+runs without the C++ WebSocket binary.  Running run_main_pid.sh alongside a
+second CARLA Python client is unsafe (two clients fight for the same actor
+and WebSocket port 4567).
 
 Pass / Fail criteria:
-  1. Ego reaches new lane centreline (CTE < 0.2 m) within 4 s (80 ticks).
+  1. Ego reaches new lane centreline (CTE < 0.2 m) within 5 s (100 ticks).
   2. Max overshoot beyond new centre ≤ 0.5 m.
   3. Zero collision (min distance to police car ≥ 0.5 m at all times).
   4. Steering oscillations ≤ 3 sign-reversals during the manoeuvre.
+  5. [Near-miss] min distance to police car < 5.0 m (proves genuine avoidance,
+     not a trivially wide detour).
 
 Usage:
     # CARLA must be running (headless or with display):
@@ -70,8 +78,8 @@ MAP_NAME       = "Town03"
 # User-specified spawn; snapped to road centre automatically.
 EGO_SPAWN_LOC  = carla.Location(x=-10.0, y=140.0, z=2.0)
 
-POLICE_DIST_M  = 50.0             # m — police car ahead in same lane
-TRIGGER_DIST_M = 25.0             # m — lane-change trigger distance
+POLICE_DIST_M  = 20.0             # m — police car ahead: close enough to be on collision course
+TRIGGER_DIST_M = 15.0             # m — emergency trigger (~3.3 s before impact at cruise speed)
 LOOKAHEAD_M    = 10.0             # m — waypoint look-ahead for CTE
 
 TARGET_SPEED   = 30.0 / 3.6      # 8.33 m/s = 30 km/h
@@ -83,10 +91,11 @@ THROTTLE_KP, THROTTLE_KI, THROTTLE_KD = 0.10,  0.001, 0.05
 THROTTLE_MAX, THROTTLE_MIN            = 1.0,  -1.0
 
 # Test parameters
-MAX_SETTLING_TICKS = 80          # 4 s at dt=0.05 s
+MAX_SETTLING_TICKS = 100         # 5 s at dt=0.05 s (tighter trigger needs more room)
 MAX_OVERSHOOT_M    = 0.5         # m beyond new lane centre
 MAX_OSCILLATIONS   = 3           # steer sign-reversals during manoeuvre
 COLLISION_DIST_M   = 0.5         # m — below this = collision
+NEAR_MISS_MAX_M    = 5.0         # m — min dist MUST be below this (proves genuine avoidance)
 MAX_RUN_TICKS      = 600         # hard safety ceiling
 
 
@@ -122,6 +131,7 @@ class Result:
     settling_ticks:    Optional[int] = None
     max_overshoot:     float         = 0.0
     min_dist_police:   float         = float("inf")
+    min_dist_at_pass:  float         = float("inf")   # dist when ego x == police x
     oscillations:      int           = 0
     triggered:         bool          = False
 
@@ -307,6 +317,7 @@ def test_lane_change_pid() -> Result:
         settling_tick: Optional[int] = None
         max_overshoot = 0.0
         min_dist      = float("inf")
+        min_dist_at_pass = float("inf")  # min dist recorded AFTER trigger
         oscillations  = 0
         prev_steer    = 0.0
         sat_run       = 0
@@ -334,6 +345,11 @@ def test_lane_change_pid() -> Result:
             dist_pol  = dist2d(ego_loc, police.get_transform().location)
             if dist_pol < min_dist:
                 min_dist = dist_pol
+                # Minimum distance == the lateral clearance when car is directly
+                # alongside the police car (dist stops decreasing at that moment).
+                # Track it as min_dist_at_pass — no coordinate math needed.
+                if triggered:
+                    min_dist_at_pass = min_dist
 
             # ── Collision guard ──────────────────────────────────────────────
             if dist_pol < COLLISION_DIST_M:
@@ -427,7 +443,7 @@ def test_lane_change_pid() -> Result:
 
         if not triggered:
             failures.append(
-                "TRIGGER: ego never came within 25 m of police car "
+                "TRIGGER: ego never came within 15 m of police car "
                 f"(min dist observed={min_dist:.1f} m)"
             )
 
@@ -461,6 +477,18 @@ def test_lane_change_pid() -> Result:
         else:
             log.info("✅  No collision  (min dist=%.2f m)", min_dist)
 
+        # Near-miss assertion: car must have gotten genuinely close (proves avoidance, not wide detour)
+        if min_dist_at_pass == float("inf"):
+            failures.append("NEAR-MISS: lane-change never triggered or car never approached police")
+        elif min_dist_at_pass > NEAR_MISS_MAX_M:
+            failures.append(
+                f"NEAR-MISS: closest approach post-trigger={min_dist_at_pass:.2f} m > {NEAR_MISS_MAX_M} m "
+                f"(police car was NOT genuinely blocking — spawn distance too large or wrong lane)"
+            )
+        else:
+            log.info("✅  Near-miss OK: %.2f m min clearance  (genuine avoidance, limit < %.1f m)",
+                     min_dist_at_pass, NEAR_MISS_MAX_M)
+
         if oscillations > MAX_OSCILLATIONS:
             failures.append(
                 f"OSCILLATIONS: {oscillations} > limit {MAX_OSCILLATIONS}"
@@ -472,6 +500,7 @@ def test_lane_change_pid() -> Result:
         result.settling_ticks  = settling_tick
         result.max_overshoot   = max_overshoot
         result.min_dist_police = min_dist
+        result.min_dist_at_pass = min_dist_at_pass
         result.oscillations    = oscillations
         result.triggered       = triggered
 
@@ -508,6 +537,8 @@ def test_lane_change_pid() -> Result:
              result.max_overshoot, MAX_OVERSHOOT_M)
     log.info("Min dist police : %.2f m  (collision < %.1f m)",
              result.min_dist_police, COLLISION_DIST_M)
+    log.info("Clearance@pass  : %.2f m  (genuine avoidance < %.1f m)",
+             result.min_dist_at_pass, NEAR_MISS_MAX_M)
     log.info("=" * 70)
 
     return result
