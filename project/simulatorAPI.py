@@ -71,10 +71,14 @@ spirals_y = []
 spirals_v = []
 obst_x = []
 obst_y = []
+obst_yaw = []
 spiral_idx = []
 last_move_time = -1
 update_cycle = True
 velocity = 0
+steer = 0.0
+throttle = 0.0
+brake = 0.0
 
 _prev_junction_id = -1
 _tl_state = 'none'
@@ -250,10 +254,12 @@ class World(object):
 #             self.world.debug.draw_line(start.location, end.location, 0.1, carla.Color(r=125, g=125, b=0), .1)
 #             previous_index = index
 
-        # increase wait time for debug
+        # In synchronous mode (fixed_delta_seconds=0.05), physics advances exactly 0.05 s
+        # per tick. delta_t matches this exactly so set_transform displacement = v_traj*0.05
+        # and CARLA velocity = v_traj. actual_dt guard is kept for safety.
         wait_time = 0.0
-        delta_t = 0.05
         if (sim_time - last_move_time) > wait_time:
+            delta_t = 0.05  # fixed; matches fixed_delta_seconds in synchronous mode
             last_move_time = sim_time
             # move car using interpolation based on the velocity label form trajectory points
             if len(way_points) > 1:
@@ -776,22 +782,29 @@ class KeyboardControl(object):
 # ==============================================================================
 
 def SpawnNPC(client, world, args, offset_x, offset_y):
-    global obst_x, obst_y
-    SpawnActor = carla.command.SpawnActor
+    """Spawn a single parked NPC at offset (offset_x fwd, offset_y right) from spawn[4].
+    Returns (actor, exact_transform) so the caller can teleport+freeze after settling."""
+    global obst_x, obst_y, obst_yaw
     blueprint = client.get_world().get_blueprint_library().filter(args.filter)[5]
-    actor_spawn =  carla.Transform()
-    # Use spawn_points[4] to match the player's spawn location so NPCs are
-    # placed 30/65/110m ahead of the vehicle (same anchor as player spawn).
     spawn_point = world.map.get_spawn_points()[4]
-    actor_spawn.location = spawn_point.location
-    actor_spawn.rotation = spawn_point.rotation
-    actor_spawn.location.x += offset_x * spawn_point.get_forward_vector().x
-    actor_spawn.location.y += offset_y * spawn_point.get_right_vector().y
-    obst_x.append(actor_spawn.location.x)
-    obst_y.append(actor_spawn.location.y)
+    fwd = spawn_point.get_forward_vector()
+    rgt = spawn_point.get_right_vector()
 
+    # Deep-copy location to avoid aliasing spawn_point.location (carla.Location is mutable).
+    sp_loc = spawn_point.location
+    exact = carla.Transform(
+        carla.Location(sp_loc.x + offset_x * fwd.x + offset_y * rgt.x,
+                       sp_loc.y + offset_x * fwd.y + offset_y * rgt.y,
+                       sp_loc.z + 3.0),   # lift above road for clean spawn
+        spawn_point.rotation
+    )
 
-    return SpawnActor(blueprint, actor_spawn)
+    actor = client.get_world().try_spawn_actor(blueprint, exact)
+    if actor:
+        obst_x.append(exact.location.x)
+        obst_y.append(exact.location.y)
+        obst_yaw.append(math.radians(exact.rotation.yaw))
+    return actor, exact
 
 async def game_loop(args):
     global update_cycle, _prev_yaw
@@ -808,8 +821,10 @@ async def game_loop(args):
         client.set_timeout(60.0)
         print("[TRACE] CARLA client created", flush=True)
 
-        # Ensure Town06_Opt is loaded. If CARLA was started with it pre-loaded, skip
-        # the load_world call to avoid RPC timeout/crash on some drivers.
+        # Ensure Town06_Opt is loaded.
+        # Town06_Opt (highway) is in project/AdditionalMaps — the same map the
+        # reviewer uses. Install AdditionalMaps into CARLA before first run:
+        #   cp -r project/AdditionalMaps/. project/CARLA/
         print("[TRACE] Checking current map...", flush=True)
         _current_map = client.get_world().get_map().name
         print(f"[TRACE] Current map: {_current_map}", flush=True)
@@ -831,26 +846,52 @@ async def game_loop(args):
         world = World(client.get_world(), hud, args)
         print("[TRACE] World created, player:", world.player, flush=True)
         controller = KeyboardControl(world)
+        print("[TRACE] Controller created", flush=True)
 
         clock = pygame.time.Clock()
 
         world.player.set_simulate_physics(True)
 
-        # Spawn some obstacles to avoid
-        batch = []
-        # Place NPCs 2.5 m south of road centre (y ≈ -12.5, lane -4).
-        # With CIRCLE_RADII=1.5 m the 3 m exclusion zone only blocks paths
-        # south of y=-9.5, leaving the y=-9 north-detour path collision-free
-        # while keeping the vehicle safely within lane -3 (y=-8.25 to -11.75).
-        batch.append(SpawnNPC(client, world, args, 30, 2.5))
-        batch.append(SpawnNPC(client, world, args, 65, 2.5))
-        batch.append(SpawnNPC(client, world, args, 110, 2.5))
-
-        for response in carla.Client.apply_batch_sync(client, batch):
-            if response.error:
-                logging.error(response.error)
+        # Spawn 3 parked NPC obstacles on Town06_Opt (highway, spawn[4]).
+        # spawn[4]: west-facing at x≈600m, y≈-10m, yaw≈-180°. Road runs west for
+        # 200m+ before any junction. NPCs at 30/65/110m ahead, alternating sides:
+        #   NPC1 +2.5m right (north), NPC2 -4.5m right (south), NPC3 +2.5m right (north)
+        # Spawn individually at z+0.5, wait for physics, then freeze at exact positions.
+        npc_offsets = [(30, 2.5), (65, -4.5), (110, 2.5)]
+        npc_actors = []
+        npc_targets = []
+        for off_x, off_y in npc_offsets:
+            actor, exact = SpawnNPC(client, world, args, off_x, off_y)
+            if actor:
+                vehicles_list.append(actor.id)
+                npc_actors.append(actor)
+                npc_targets.append(exact)
             else:
-                vehicles_list.append(response.actor_id)
+                logging.warning(f"NPC spawn failed at offset ({off_x}, {off_y})")
+
+        print(f"[TRACE] NPCs spawned: {len(vehicles_list)} vehicles", flush=True)
+
+        # Wait for physics to settle, then teleport NPCs to exact positions and freeze.
+        await asyncio.sleep(1.5)
+        for actor, target in zip(npc_actors, npc_targets):
+            try:
+                target.location.z -= 3.0   # bring back down to road level after z+3.0 spawn
+                actor.set_simulate_physics(False)   # freeze physics before teleporting
+                actor.set_transform(target)
+            except Exception as e:
+                logging.warning(f"NPC freeze failed: {e}")
+
+        # Read back actual post-freeze positions and update obstacle arrays so C++
+        # collision circles are placed at the true NPC locations.
+        for idx, actor in enumerate(npc_actors):
+            try:
+                actual = actor.get_transform()
+                obst_x[idx] = actual.location.x
+                obst_y[idx] = actual.location.y
+                print(f"[NPC{idx}] frozen at x={actual.location.x:.2f} y={actual.location.y:.2f} z={actual.location.z:.2f} yaw={actual.rotation.yaw:.1f}", flush=True)
+            except Exception as e:
+                logging.warning(f"NPC position read failed for NPC{idx}: {e}")
+        print("[TRACE] NPCs frozen at exact positions", flush=True)
 
         start_time = world.hud.simulation_time
 
@@ -912,7 +953,7 @@ async def game_loop(args):
                 velocity = math.sqrt(real_v.x**2 + real_v.y**2)
                 print('velocity sent: ', velocity)
                 print(f'[DBG] sending yaw={vehicle_yaw_rad:.4f} rad ({t.rotation.yaw:.1f} deg) x={location_x:.2f} y={location_y:.2f}')
-                ws.send(json.dumps({'traj_x': x_points, 'traj_y': y_points, 'traj_v': v_points ,'yaw': vehicle_yaw_rad, "velocity": velocity, 'time': sim_time, 'waypoint_x': waypoint_x, 'waypoint_y': waypoint_y, 'waypoint_t': waypoint_t, 'waypoint_j': waypoint_j, 'tl_state': _tl_state, 'obst_x': obst_x, 'obst_y': obst_y, 'location_x': location_x, 'location_y': location_y, 'location_z': location_z } ))
+                ws.send(json.dumps({'traj_x': x_points, 'traj_y': y_points, 'traj_v': v_points ,'yaw': vehicle_yaw_rad, "velocity": velocity, 'time': sim_time, 'waypoint_x': waypoint_x, 'waypoint_y': waypoint_y, 'waypoint_t': waypoint_t, 'waypoint_j': waypoint_j, 'tl_state': _tl_state, 'obst_x': obst_x, 'obst_y': obst_y, 'obst_yaw': obst_yaw, 'location_x': location_x, 'location_y': location_y, 'location_z': location_z } ))
 
             clock.tick_busy_loop(60)
             world.tick(clock)
@@ -926,10 +967,20 @@ async def game_loop(args):
         print('EXCEPTION IN GAME LOOP:')
         print(error)
         traceback.print_exc()
+        print(flush=True)
+
+    except BaseException as error:
+        import traceback
+        print('FATAL EXCEPTION IN GAME LOOP:')
+        print(error)
+        traceback.print_exc()
+        print(flush=True)
+        raise
 
     finally:
 
         print("key board interrupt, good bye")
+
         if world is not None:
             world.destroy()
 

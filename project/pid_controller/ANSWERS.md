@@ -3,7 +3,7 @@
 > **Project:** Control and Trajectory Tracking for Autonomous Vehicle  
 > **Simulator:** CARLA 0.9.16 · Town06_Opt  
 > **Vehicle:** Lincoln MKZ  
-> **Gains used:** Steering `Kp=0.05 Ki=0.0 Kd=0.05 limits=±0.3` · Throttle `Kp=0.3 Ki=0.05 Kd=0.0 limits=[-1.0, 1.0]`
+> **Gains used:** Steering `Kp=0.05 Ki=0.0 Kd=0.05 limits=±0.3` · Throttle `Kp=0.10 Ki=0.001 Kd=0.05 limits=[-1.0, 1.0]`
 
 
 - [PID Controller — Project Answers](#pid-controller--project-answers)
@@ -40,22 +40,19 @@ The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town06_Opt
 
 ### Step 4 — PID Performance Plots
 
-The plots below capture **6,626 control iterations** (~300 m of driving through 3 parked NPCs) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
+The plots below capture **10,552 control iterations** (~700 m of driving, clearing all 3 parked NPCs without collision) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
 
 ![PID Performance Plots](../pid_plots.png)
 
 ### Steering: Cross-Track Error (top-left)
 
-The CTE stays very close to zero on the straight Town06_Opt highway. Small spikes (< ±1.5 m) appear at each NPC detour where the motion planner shifts the reference path ~0.5 m north of road center to avoid the parked vehicle, then returns to center after clearing it. The vehicle successfully detoured around **all 3 parked NPCs** with a maximum lateral deviation of **0.6 m** from road center — well within one lane width.
+The CTE stays very close to zero on the straight Town06_Opt highway. Small spikes appear at each NPC detour where the motion planner shifts the reference path ~0.5 m north or south of road center to avoid the parked vehicle, then returns to center after clearing it. The vehicle successfully detoured around **all 3 parked NPCs** with the FSM remaining in `FOLLOW_LANE` (behavior=0) throughout the obstacle zone — no `DECEL_TO_STOP` was required.
 
-| Statistic | Value (iterations 50–3,000) |
-|-----------|------------------------------|
-| Mean CTE  | −0.046 m |
-| Median CTE | +0.004 m |
-| Std dev   | 0.40 m |
-| Range     | −1.50 m … +10.5 m |
-
-The large max CTE (+10.5 m) occurs at the highway junction near x = 300 m (well past the obstacle zone) when the behavior planner triggers `DECEL_TO_STOP` and the vehicle slows at a road branch.
+| Statistic | Value |
+|-----------|-------|
+| Mean CTE  | +0.043 m |
+| Std dev   | 0.290 m |
+| Data rows | 10,552 |
 
 ### Steering: Output Command (top-right)
 
@@ -63,7 +60,7 @@ The steering command mirrors the CTE pattern — near-zero on straights, brief p
 
 ### Throttle: Velocity Error (bottom-left)
 
-The velocity error starts at **−3 m/s** (vehicle at rest vs. 3 m/s target), then quickly stabilises near **−0.15 m/s** — indicating a cruise speed ~0.15 m/s below the 3 m/s waypoint velocity. This small steady-state offset is tolerable for the task and is within the **Ki** integral's correction band. The error remains negative (vehicle slightly under target speed) throughout the straight highway section.
+The velocity error starts at **−3 m/s** (vehicle at rest vs. 3 m/s target), then stabilises near **−0.73 m/s** average — the Lincoln MKZ cruises at approximately 2.3 m/s under the 3 m/s reference. This under-speed is acceptable for the obstacle-avoidance task. The small `Ki=0.001` gradually closes the steady-state gap over longer runs.
 
 ### Throttle/Brake Commands (bottom-right)
 

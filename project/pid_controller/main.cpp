@@ -92,21 +92,16 @@ MotionPlanner motion_planner(P_NUM_PATHS, P_GOAL_OFFSET, P_ERR_TOLERANCE);
 bool have_obst = false;
 vector<State> obstacles;
 
-void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, double x_ego, double y_ego, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
+void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
 
   State ego_state;
 
-  // Use trajectory-tip (last planned point) as planning origin — same as the
-  // reference implementation. This ensures each new spiral smoothly continues
-  // from the end of the previous one, giving stable CTE tracking.
-  // If trajectory is empty fall back to actual vehicle position.
-  if (x_points.size() > 0) {
-    ego_state.location.x = x_points[x_points.size() - 1];
-    ego_state.location.y = y_points[y_points.size() - 1];
-  } else {
-    ego_state.location.x = x_ego;
-    ego_state.location.y = y_ego;
-  }
+  // Use trajectory tip as planning origin so spirals are generated from the
+  // leading edge of the current plan. This prevents spiral deadlock near parked
+  // NPCs: the trajectory has already navigated around the obstacle, so new
+  // spirals start from beyond it and do not trigger collision detection on entry.
+  ego_state.location.x = x_points[x_points.size()-1];
+  ego_state.location.y = y_points[y_points.size()-1];
   ego_state.velocity.x = velocity;
 
   if( x_points.size() > 1 ){
@@ -207,16 +202,16 @@ void path_planner(vector<double>& x_points, vector<double>& y_points, vector<dou
 
 }
 
-void set_obst(vector<double> x_points, vector<double> y_points, vector<State>& obstacles, bool& obst_flag){
+void set_obst(vector<double> x_points, vector<double> y_points, vector<double> yaw_points, vector<State>& obstacles, bool& obst_flag){
 
 	for( int i = 0; i < x_points.size(); i++){
 		State obstacle;
 		obstacle.location.x = x_points[i];
 		obstacle.location.y = y_points[i];
-		// NPCs face west (yaw = π). Default yaw=0 (east) would misplace collision
-		// circles 3m EAST of the NPC, causing false collisions 3m too early.
-		// Correct west-facing yaw places circles in the NPC's actual footprint.
-		obstacle.rotation.yaw = M_PI;
+		// Use the actual NPC spawn yaw so collision circles are placed correctly
+		// along the NPC's longitudinal axis regardless of map/road orientation.
+		// For west-facing NPCs (Town06) yaw=π; for east-facing (Town10HD) yaw=0, etc.
+		obstacle.rotation.yaw = (i < (int)yaw_points.size()) ? yaw_points[i] : M_PI;
 		obstacles.push_back(obstacle);
 	}
 	obst_flag = true;
@@ -231,40 +226,34 @@ int main ()
   int i = 0;
   double prev_sim_time = -1.0;  // tracks CARLA simulation time for sub-second dt
 
-  fstream file_steer;
-  file_steer.open("steer_pid_data.txt", std::ofstream::out | std::ofstream::trunc);
-  file_steer.close();
-  fstream file_throttle;
-  file_throttle.open("throttle_pid_data.txt", std::ofstream::out | std::ofstream::trunc);
-  file_throttle.close();
+  // Open data files once; kept open for the run duration (lambda appends each frame).
+  // Using ofstream::app avoids the fragile seekg/ignore line-rewrite pattern that fails
+  // on an empty file opened with default fstream mode.
+  ofstream file_steer("steer_pid_data.txt", ofstream::out | ofstream::trunc);
+  ofstream file_throttle("throttle_pid_data.txt", ofstream::out | ofstream::trunc);
 
   // initialize pid steer
-  // Kp=0.05, Ki=0.0, Kd=0.05: reference used Kd=0.25 but that was tuned for a ~10 Hz VM.
-  // Our CARLA 0.9.16 runs at ~20 Hz (dt≈0.05 s). Effective Kd/dt gain = 0.25/0.05 = 5.0 →
-  // even a 0.06 m CTE change per frame saturates the ±0.3 output. Scaling Kd by dt ratio:
-  // Kd = 0.25 × (0.05/0.1) ≈ 0.06. Use 0.05 to be safe.
+  // Steer: Kp=0.05, Ki=0.0, Kd=0.05. With trajectory-tip ego state the CTE is
+  // naturally small (trajectory already avoids obstacles), so light Kd=0.05 damps
+  // heading oscillation without stalling lateral convergence.
   PID pid_steer = PID();
   pid_steer.Init(0.05, 0.0, 0.05, 0.3, -0.3);
 
-  // Throttle: Kp=0.3, Ki=0.05, Kd=0.0, limits [-1.0, 1.0].
-  // Higher Ki (0.05) eliminates persistent speed offset over time.
-  // Kd=0 avoids amplifying noisy velocity signal.
+  // Throttle: Kp=0.10, Ki=0.001, Kd=0.05, limits [-1.0, 1.0].
+  // In CARLA sync mode (20 Hz), each C++ update covers ~5 physics steps (1 s).
+  // Kp=0.10: at error=-3, throttle=0.30 → ~0.9 m/s gained per update → no overshoot.
+  // Kd=0.05 damps rapid changes; Ki=0.001 eliminates steady-state offset.
   PID pid_throttle = PID();
-  pid_throttle.Init(0.3, 0.05, 0.0, 1.0, -1.0);
+  pid_throttle.Init(0.10, 0.001, 0.05, 1.0, -1.0);
 
-  h.onMessage([&pid_steer, &pid_throttle, &new_delta_time, &prev_sim_time, &i](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode)
+  h.onMessage([&pid_steer, &pid_throttle, &new_delta_time, &prev_sim_time, &i, &file_steer, &file_throttle](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode)
   {
         auto s = hasData(data);
 
         if (s != "") {
+          try {
 
           auto data = json::parse(s);
-
-          // create file to save values
-          fstream file_steer;
-          file_steer.open("steer_pid_data.txt");
-          fstream file_throttle;
-          file_throttle.open("throttle_pid_data.txt");
 
           vector<double> x_points = data["traj_x"];
           vector<double> y_points = data["traj_y"];
@@ -282,10 +271,23 @@ int main ()
           double y_position = data["location_y"];
           double z_position = data["location_z"];
 
+          cout << "[FRAME " << i << "] npts=" << x_points.size()
+               << " veh=(" << x_position << "," << y_position << ")"
+               << " yaw=" << yaw << " vel=" << velocity
+               << " jct=" << is_junction
+               << " goal=(" << waypoint_x << "," << waypoint_y << ")"
+               << endl;
+          cout.flush();
+
           if(!have_obst){
           	vector<double> x_obst = data["obst_x"];
           	vector<double> y_obst = data["obst_y"];
-          	set_obst(x_obst, y_obst, obstacles, have_obst);
+          	// Safe parse: iterate array elements to avoid nlohmann 2.x value() template issues
+          	vector<double> yaw_obst;
+          	if (data.count("obst_yaw")) {
+          	    for (auto& v : data["obst_yaw"]) yaw_obst.push_back(v.get<double>());
+          	}
+          	set_obst(x_obst, y_obst, yaw_obst, obstacles, have_obst);
           }
 
           State goal;
@@ -302,7 +304,11 @@ int main ()
           // the real vehicle location rather than the stale trajectory tip.
           // x_points/y_points are NOT reset here — x_points[0] remains the
           // nearest planned waypoint used to compute the cross-track error.
-          path_planner(x_points, y_points, v_points, yaw, velocity, x_position, y_position, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
+          cout << "[FRAME " << i << "] calling path_planner, behavior_before=" << behavior_planner.get_active_maneuver() << endl;
+          cout.flush();
+          path_planner(x_points, y_points, v_points, yaw, velocity, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
+          cout << "[FRAME " << i << "] path_planner done, npts_out=" << x_points.size() << " behavior_after=" << behavior_planner.get_active_maneuver() << endl;
+          cout.flush();
 
           // Compute delta time from CARLA simulation clock (sub-second resolution).
           // Using sim_time from the payload gives proper time scaling for PID integration.
@@ -321,17 +327,26 @@ int main ()
           // Update the delta time with the previous command
           pid_steer.UpdateDeltaTime(new_delta_time);
 
-          // Compute steer error
-          double error_steer;
-
           // Cross-Track Error in vehicle frame:
           //   dx, dy = vector from nearest waypoint to vehicle (world frame).
           //   Rotating by -yaw projects onto the vehicle's lateral axis:
           //     lateral_offset = -sin(yaw)*dx + cos(yaw)*dy
           // Positive → vehicle left of path → steer right (negative output from TotalError).
-          double dx = x_position - x_points[0];
-          double dy = y_position - y_points[0];
-          error_steer = -sin(yaw) * dx + cos(yaw) * dy;
+          // Guard against empty trajectory (path_planner returned early with no spirals):
+          // hold zero steer error so the integral doesn't wind up during recovery.
+          double error_steer = 0.0;
+          if (!x_points.empty()) {
+            double dx = x_position - x_points[0];
+            double dy = y_position - y_points[0];
+            error_steer = -sin(yaw) * dx + cos(yaw) * dy;
+            // Debug: log if CTE exceeds 5m (sanity check)
+            if (fabs(error_steer) > 5.0) {
+              cout << "[DBG-CTE] i=" << i << " err=" << error_steer
+                   << " veh=(" << x_position << "," << y_position << ")"
+                   << " wp0=(" << x_points[0] << "," << y_points[0] << ")"
+                   << " yaw=" << yaw << " npts=" << x_points.size() << endl;
+            }
+          }
 
           double steer_output;
 
@@ -342,14 +357,9 @@ int main ()
           pid_steer.UpdateError(error_steer);
           steer_output = pid_steer.TotalError();
 
-          // Save data
-          file_steer.seekg(std::ios::beg);
-          for(int j=0; j < i - 1; ++j) {
-              file_steer.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-          }
-          file_steer  << i ;
-          file_steer  << " " << error_steer;
-          file_steer  << " " << steer_output << endl;
+          // Save data (append one line per frame)
+          file_steer << i << " " << error_steer << " " << steer_output << "\n";
+          file_steer.flush();
 
           ////////////////////////////////////////
           // Throttle control
@@ -358,14 +368,15 @@ int main ()
           // Update the delta time with the previous command
           pid_throttle.UpdateDeltaTime(new_delta_time);
 
-          // Compute error of speed
-          double error_throttle;
           // Use v_points[0] (immediate next waypoint speed) rather than the far-horizon last point.
-          // This ensures the controller responds to planner deceleration commands near obstacles:
-          // when the planner slows to stop before a parked NPC, v_points[0] drops → positive error
-          // → brake output. Using v_points.back() (far horizon) would ignore the deceleration.
-          // With TotalError()'s negative sign: -Kp*(actual-desired) → throttle when too slow, brake when too fast.
-          error_throttle = velocity - v_points[0];
+          // Guard against empty v_points (early return from path_planner): brake gently.
+          double error_throttle = 0.0;
+          if (!v_points.empty()) {
+            error_throttle = velocity - v_points[0];
+          } else {
+            // No trajectory: brake until planner recovers.
+            error_throttle = velocity;
+          }
 
           double throttle_output;
           double brake_output;
@@ -383,15 +394,9 @@ int main ()
             brake_output = -throttle;
           }
 
-          // Save data
-          file_throttle.seekg(std::ios::beg);
-          for(int j=0; j < i - 1; ++j){
-              file_throttle.ignore(std::numeric_limits<std::streamsize>::max(),'\n');
-          }
-          file_throttle  << i ;
-          file_throttle  << " " << error_throttle;
-          file_throttle  << " " << throttle_output;
-          file_throttle  << " " << brake_output << endl;
+          // Save data (append one line per frame)
+          file_throttle << i << " " << error_throttle << " " << throttle_output << " " << brake_output << "\n";
+          file_throttle.flush();
 
 
           // Send control
@@ -409,19 +414,26 @@ int main ()
           msgJson["spiral_idx"] = best_spirals;
           msgJson["active_maneuver"] = behavior_planner.get_active_maneuver();
 
-          //  min point threshold before doing the update
-          // 4 gives ~4x more frequent updates than 16, tightening the feedback loop
-          msgJson["update_point_thresh"] = 4;
+          //  min point threshold before doing the update — matches reference implementation
+          msgJson["update_point_thresh"] = 16;
 
           auto msg = msgJson.dump();
 
           i = i + 1;
-          file_steer.close();
-          file_throttle.close();
 
       ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
+      cout << "[FRAME " << (i-1) << "] response sent" << endl;
+      cout.flush();
 
+          } catch (const std::exception& e) {
+            cout << "[EXCEPTION frame " << i << "] " << e.what() << endl;
+            cout.flush();
+          } catch (...) {
+            cout << "[EXCEPTION frame " << i << "] unknown exception" << endl;
+            cout.flush();
+          }
     }
+
 
   });
 

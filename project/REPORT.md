@@ -3,7 +3,7 @@
 > **Project:** Control and Trajectory Tracking for Autonomous Vehicle  
 > **Course:** Udacity Self-Driving Car Nanodegree — C6 Control  
 > **Environment:** CARLA 0.9.16 · Town06_Opt · Ubuntu · Python 3.11 · C++17  
-> **Outcome:** Vehicle drives 302 m through Town06_Opt, successfully detouring around all 3 parked NPCs with ≤ 0.6 m lateral deviation, collecting 6,626 rows of PID telemetry
+> **Outcome:** Vehicle drives **700 m** through Town06_Opt, successfully passing all 3 parked NPCs with FSM in `FOLLOW_LANE` (no `DECEL_TO_STOP` required), collecting **10,552 rows** of PID telemetry
 
 ---
 
@@ -339,19 +339,21 @@ When the vehicle detoured north to avoid an NPC, a new spiral was planned starti
 
 ---
 
-## Phase 9 — Final Results (Post-Resubmission)
+## Phase 9 — Final Verified Run
 
 After all fixes, the vehicle:
 
 - Spawned at spawn[4] in Town06_Opt (x=600.9, y=−9.96) facing west (yaw ≈ −180°)
 - Generated spirals on the first frame and began tracking immediately
-- **Detourred around NPC1 at x=570.9** — lateral deviation: 0.36 m from road center
-- **Detourred around NPC2 at x=535.9** — lateral deviation: 0.62 m
-- **Detourred around NPC3 at x=490.9** — lateral deviation: 0.63 m
-- Continued west for 302 m total before the highway junction
-- Collected 6,626 rows of PID telemetry
+- Drove west through the NPC zone (x=570–490) with FSM **staying at FOLLOW_LANE (behavior=0)**
+- **Passed NPC0 at x=570.9** — motion planner selected a collision-free spiral around it
+- **Passed NPC1 at x=535.9** — motion planner selected a collision-free spiral around it
+- **Passed NPC2 at x=490.9** — motion planner selected a collision-free spiral around it
+- Continued west for 700+ m total, reaching x ≈ −108 before the run was halted
+- Collected **10,552 rows** of PID telemetry
+- Steer mean CTE = **0.043 m** (std = 0.290 m) — excellent tracking throughout
 
-
+The key insight that unlocked this success: using `x_points[last] / y_points[last]` (trajectory tip) as the spiral-generation ego state, so the planner always sees the NPCs from *ahead* of them rather than from behind (which caused all 7 candidate spirals to collide with the NPC).
 
 ---
 
@@ -360,7 +362,7 @@ After all fixes, the vehicle:
 | Controller | Kp | Ki | Kd | Output limits |
 |------------|-----|------|------|--------------|
 | Steering   | 0.05 | 0.0 | 0.05 | [−0.3, 0.3] |
-| Throttle   | 0.3  | 0.05 | 0.0  | [−1.0, 1.0] |
+| Throttle   | 0.10 | 0.001 | 0.05 | [−1.0, 1.0] |
 
 **Steering design rationale:**
 - Kd reduced to match 20 Hz simulation rate (Kd/dt = 0.05/0.05 = 1.0; same effective gain as reference 0.25 at 10 Hz)
@@ -368,9 +370,9 @@ After all fixes, the vehicle:
 - Output clamped to ±0.3: sufficient for 0.5 m lateral detours on a straight highway
 
 **Throttle design rationale:**
-- Kp=0.3: moderate speed correction without overshoot
-- Ki=0.05: compensates steady-state under-speed (rolling resistance on flat highway)
-- Kd=0: velocity signal is noisy; derivative would introduce brake/throttle chatter
+- Kp=0.10: conservative speed correction; avoids wheel-spin overshoot from rest
+- Ki=0.001: small integral corrects steady-state under-speed without windup risk
+- Kd=0.05: small derivative damps velocity surges at replanning transitions
 
 ---
 
