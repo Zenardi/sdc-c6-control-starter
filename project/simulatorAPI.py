@@ -795,7 +795,7 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
     exact = carla.Transform(
         carla.Location(sp_loc.x + offset_x * fwd.x + offset_y * rgt.x,
                        sp_loc.y + offset_x * fwd.y + offset_y * rgt.y,
-                       sp_loc.z + 3.0),   # lift above road for clean spawn
+                       sp_loc.z + 0.5),   # slight lift above road for clean spawn (0.5m = less physics drift than 3.0m)
         spawn_point.rotation
     )
 
@@ -853,11 +853,16 @@ async def game_loop(args):
         world.player.set_simulate_physics(True)
 
         # Spawn 3 parked NPC obstacles on Town06_Opt (highway, spawn[4]).
-        # spawn[4]: west-facing at x≈600m, y≈-10m, yaw≈-180°. Road runs west for
-        # 200m+ before any junction. NPCs at 30/65/110m ahead, alternating sides:
-        #   NPC1 +2.5m right (north), NPC2 -4.5m right (south), NPC3 +2.5m right (north)
-        # Spawn individually at z+0.5, wait for physics, then freeze at exact positions.
-        npc_offsets = [(30, 2.5), (65, -4.5), (110, 2.5)]
+        # spawn[4]: west-facing at x≈600m, y≈-10m, yaw≈-180° (actual -179.6°).
+        # The forward vector has fwd.y≈-0.007, so over 30/65/110m it drifts
+        # -0.21/-0.45/-0.77m in y. Offsets below are corrected so each NPC lands
+        # at exactly ±2.5m lateral from road centre regardless of distance:
+        #   NPC0 (30m): offset_y=2.29 → NPC y≈-12.46 (2.5m north)
+        #   NPC1 (65m): offset_y=-2.95 → NPC y≈-7.46  (2.5m south)
+        #   NPC2 (110m): offset_y=1.73 → NPC y≈-12.46 (2.5m north)
+        # 2.5m lateral: physically clear (>2.1m vehicle width) AND within 3.0m
+        # collision-circle threshold → motion planner detects and routes around.
+        npc_offsets = [(30, 2.29), (65, -2.95), (110, 1.73)]
         npc_actors = []
         npc_targets = []
         for off_x, off_y in npc_offsets:
@@ -875,7 +880,7 @@ async def game_loop(args):
         await asyncio.sleep(1.5)
         for actor, target in zip(npc_actors, npc_targets):
             try:
-                target.location.z -= 3.0   # bring back down to road level after z+3.0 spawn
+                target.location.z -= 0.5   # bring to road level (spawned at z+0.5)
                 actor.set_simulate_physics(False)   # freeze physics before teleporting
                 actor.set_transform(target)
             except Exception as e:
