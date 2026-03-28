@@ -44,8 +44,13 @@ void PID::UpdateError(double cte) {
     double dt = (_new_delta_time > 0.0) ? _new_delta_time : 1.0;
     if (dt > 0.5) dt = 0.5;
 
-    // D error: rate of change of CTE (smooths correction, reduces overshoot)
-    _d_error = (cte - previous_p_error) / dt;
+    // D error: rate of change of CTE, smoothed with an exponential moving average
+    // (alpha=0.25) to suppress high-frequency CTE noise that Kd=0.25 amplifies.
+    // Without this filter, tiny spiral-waypoint jitter produces large d_error spikes
+    // (noise * Kd / dt) that appear as the left/right steer oscillation during lane changes.
+    const double alpha = 0.25;
+    double d_raw = (cte - previous_p_error) / dt;
+    _d_error = alpha * d_raw + (1.0 - alpha) * _d_error;
 
     // I error: accumulated CTE * dt (corrects persistent steady-state offset)
     _i_error += cte * dt;

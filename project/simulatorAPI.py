@@ -91,6 +91,7 @@ _pivot = carla.Transform()
 # triggering NPC is passed (ahead < 0) to prevent mid-lane-change oscillation.
 _avoid_target_y = None   # committed avoidance Y; None = not avoiding
 _avoid_npc_x = None      # X of the NPC that started the avoidance
+_avoid_ramp_y = None     # current ramped y (moves toward _avoid_target_y at RAMP_RATE m/frame)
 
 # keep track of how level the ground is for teleportation
 _road_height = 0
@@ -848,7 +849,7 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
     return actor, exact
 
 async def game_loop(args):
-    global update_cycle, _prev_yaw, _avoid_target_y, _avoid_npc_x
+    global update_cycle, _prev_yaw, _avoid_target_y, _avoid_npc_x, _avoid_ramp_y
     import sys
     print("[TRACE] game_loop starting", flush=True)
     pygame.init()
@@ -1070,11 +1071,22 @@ async def game_loop(args):
                                     still_ahead = True
                                     break
                         if still_ahead:
-                            waypoint_y = _avoid_target_y
+                            # Ramp waypoint_y toward _avoid_target_y at 0.05 m/frame to avoid
+                            # a sudden 3.5 m CTE jump that would saturate the steer PID's D term.
+                            _RAMP_RATE = 0.05  # m/frame (~1.5 m/s lateral at 30 fps)
+                            if _avoid_ramp_y is None:
+                                _avoid_ramp_y = location_y
+                            gap = _avoid_target_y - _avoid_ramp_y
+                            if abs(gap) > _RAMP_RATE:
+                                _avoid_ramp_y += math.copysign(_RAMP_RATE, gap)
+                            else:
+                                _avoid_ramp_y = _avoid_target_y
+                            waypoint_y = _avoid_ramp_y
                         else:
                             print(f'[AVOID] NPC at x≈{_avoid_npc_x:.0f} passed — releasing avoidance (was y={_avoid_target_y:.2f})')
                             _avoid_target_y = None
                             _avoid_npc_x = None
+                            _avoid_ramp_y = None
 
                     # --- B. Not yet avoiding: detect and commit ---
                     if _avoid_target_y is None:
@@ -1123,8 +1135,9 @@ async def game_loop(args):
                             if adj_wp is not None:
                                 _avoid_target_y = adj_wp.transform.location.y
                                 _avoid_npc_x = ox_near
-                                waypoint_y = _avoid_target_y
-                                print(f'[AVOID] NEW: NPC {blocking_obs[0][0]:.1f}m ahead (lat={abs(oy_near-ego_lane_y):.1f}m from lane ctr) → committing to lane y={waypoint_y:.2f}')
+                                _avoid_ramp_y = location_y   # ramp starts from current position
+                                waypoint_y = _avoid_ramp_y   # first frame: unchanged (no spike)
+                                print(f'[AVOID] NEW: NPC {blocking_obs[0][0]:.1f}m ahead (lat={abs(oy_near-ego_lane_y):.1f}m from lane ctr) → committing to lane y={_avoid_target_y:.2f} (ramp from {location_y:.2f})')
                             else:
                                 print(f'[AVOID] NPC {blocking_obs[0][0]:.1f}m ahead — no free adjacent lane, holding y={waypoint_y:.2f}')
 
