@@ -3,46 +3,57 @@
 // Add the plots to your report and explain them (describe what you see)
 
 // --- PLOT DESCRIPTION ---
-// The four plots capture 152 control iterations (~3 minutes of driving through Town10HD_Opt):
+// The four plots capture 3,761 control iterations (~370 m of driving through Town06_Opt,
+// successfully avoiding all 3 parked police-car NPCs in alternating lanes):
 //
-// 1. Steering CTE (top-left): The cross-track error oscillates around zero with occasional
-//    large excursions (up to ±5 m) at intersections and tight corners where the motion
-//    planner briefly places the reference path far from the current vehicle position.
-//    Between maneuvers the error converges back toward zero, confirming the Kd term is
-//    successfully damping oscillations.
+// 1. Steering CTE (top-left): The cross-track error stays close to zero on the straight
+//    Town06_Opt highway.  Three spike clusters mark the three lane-change manoeuvres:
+//    NPC0 (iter 16–184, CTE −1.29 to −0.39 m), NPC1 (iter 1073–1262, +0.13 to +1.25 m),
+//    and NPC2 (iter 2291–2434, −1.18 to −0.27 m).  The sign of CTE indicates direction:
+//    negative = car north of goal (must steer south); positive = car south of goal.
+//    The Python goal-ramp (0.05 m/frame) prevents instantaneous CTE jumps that would
+//    saturate the derivative term; the steer command never hit the ±1.2 rad limit.
+//    Overall: mean CTE = +0.053 m, std = 0.366 m, max|CTE| = 1.288 m.
 //
-// 2. Steering Output (top-right): The steering command mirrors the CTE pattern — small
-//    corrections during straight segments, larger corrections at corners.  Commands stay
-//    well within the ±1.2 rad saturation limits, indicating the gain choices avoid output
-//    saturation for normal driving.
+// 2. Steering Output (top-right): The steering command mirrors the CTE — near-zero on
+//    straights, smooth pulses at each NPC detour.  Peak command = 0.187 rad (16% of the
+//    ±1.2 rad limit).  The EMA derivative filter (α=0.25) eliminates high-frequency
+//    spiral-waypoint jitter, keeping the output smooth throughout.
 //
-// 3. Throttle Velocity Error (bottom-left): Error starts at -3 m/s (vehicle at rest,
-//    target ~3 m/s) then rises toward zero as the vehicle accelerates.  The mean error
-//    stabilises around -1.1 m/s, meaning the vehicle cruises at roughly 1.9 m/s — under
-//    the 3 m/s target but within a stable steady-state set by the conservative gains.
+// 3. Throttle Velocity Error (bottom-left): Error starts at −3.0 m/s (vehicle at rest,
+//    target 3 m/s) then converges to near-zero within 200 frames.  Steady-state error ≈
+//    −0.003 m/s — the Ki=0.05 integral term has closed the gap almost completely.
+//    Small transient spikes (±0.1 m/s) appear at replanning cycles but are corrected
+//    within a few frames.
 //
-// 4. Throttle/Brake Commands (bottom-right): Throttle stays in the 0.3–0.4 range
-//    throughout (well below the 0.6 cap), and brake is rarely applied.  This smooth,
-//    non-saturating profile confirms the gain reduction (Kp 0.3→0.15) successfully
-//    eliminated the original overshoot.
+// 4. Throttle/Brake Commands (bottom-right): Throttle holds at 0.383 average (below the
+//    CARLA 1.0 cap). The initial burst reaches 0.908 (frames 0–50, vehicle from rest),
+//    then settles into cruise. Brake is never applied (0 frames with brake > 0.01).
+//    With Kd=0.0 for throttle there is no derivative noise amplification.
 
 // --- What is the effect of the PID according to the plots, how each part of the PID affects the control command? ---
 //
 // Proportional (Kp): Provides the primary corrective action proportional to the current
-//   error.  For steering, Kp snaps the vehicle toward the path; for throttle, Kp drives
-//   acceleration in proportion to the speed deficit.  Setting Kp too high causes the
-//   vehicle to overshoot (observed with Kp_throttle=0.3: throttle shot to 0.9, accelerating
-//   the Lincoln MKZ to 14+ m/s in under a second).
+//   error. For steering, Kp=0.05 generates a correction proportional to the cross-track
+//   error, pulling the vehicle toward the planned spiral path. For throttle, Kp=0.3
+//   drives acceleration proportional to the speed deficit (vel_err = actual − target).
+//   The initial throttle burst (0.908) at frame 0 came directly from Kp × (−3.0 m/s) =
+//   0.3 × 3 = 0.9, demonstrating pure proportional action from rest.
 //
-// Integral (Ki): Corrects persistent steady-state bias.  Ki=0 for steering prevents
-//   windup on rapidly-changing lateral errors (curves).  A small Ki=0.001 for throttle
-//   nudges the vehicle toward the target speed over time, compensating for rolling
-//   resistance or grade.
+// Integral (Ki): Corrects persistent steady-state bias. Ki=0 for steering prevents
+//   windup through NPC detour manoeuvres (a non-zero integral would build a lane-bias
+//   residual that overshoots back after the NPC is cleared). Ki=0.05 for throttle proved
+//   decisive: without it the vehicle cruised 0.7 m/s below target; with it, steady-state
+//   velocity error converges to ≈ −0.003 m/s.
 //
-// Derivative (Kd): Anticipates the trend of the error and opposes it.  For steering,
-//   Kd=0.3 is the dominant term — it detects the vehicle rotating toward the path and
-//   reduces the correction before it overshoots, producing smooth lane-keeping.
-//   For throttle, Kd=0.1 provides light velocity-change damping.
+// Derivative (Kd): Anticipates the error trend and opposes it. For steering, Kd=0.25
+//   damps lateral oscillation by sensing the rate of CTE change and reducing the
+//   correction before overshoot. An EMA filter (α=0.25) is applied to the raw derivative
+//   to suppress frame-to-frame spiral-waypoint jitter (Kd/dt ≈ 7.5 at 30 Hz would
+//   otherwise amplify 0.01 m noise into 0.075 rad steer pulses every frame). Without
+//   the goal-ramp and EMA, a single-frame 3.5 m CTE jump produced d_raw=102, steer
+//   clamped to 1.2 for 32 consecutive frames. For throttle, Kd=0.0 deliberately avoids
+//   amplifying velocity sensor noise into throttle chatter.
 
 // --- How would you design a way to automatically tune the PID parameters? ---
 //
@@ -83,13 +94,19 @@
 //
 // 1. Anti-windup clamping: freeze Ki accumulation whenever the output is saturated,
 //    preventing the integral from growing beyond what actuators can deliver.
-// 2. Gain scheduling: use a lookup table indexed by speed (high Kp at low speed for
+// 2. Goal-ramp smoothing (already implemented): lane-change target moves 0.05 m/frame
+//    toward the new lane instead of jumping instantly, eliminating the derivative kick
+//    that previously caused 32 sign-flip oscillations over 8 m.
+// 3. Derivative EMA filter (already implemented, α=0.25): suppresses high-frequency
+//    CTE jitter without delaying response to genuine errors; steer max dropped from
+//    1.2 (clamped) to 0.187 during lane changes.
+// 4. Gain scheduling: use a lookup table indexed by speed (high Kp at low speed for
 //    parking maneuvers, lower Kp at highway speeds to avoid oscillation).
-// 3. Feedforward + PID: add a feedforward term from the planned curvature
+// 5. Feedforward + PID: add a feedforward term from the planned curvature
 //    (steering ≈ wheelbase / radius_of_curvature) so the PID only corrects residuals.
-// 4. Model Predictive Control (MPC): optimise a control sequence over a receding
+// 6. Model Predictive Control (MPC): optimise a control sequence over a receding
 //    horizon (e.g. 1 second), explicitly handling actuator limits and trajectory
 //    shape — eliminates the lag inherent in pure feedback control.
-// 5. Increase update rate: reduce update_point_thresh further (4→2) so the C++
+// 7. Increase update rate: reduce update_point_thresh further (4→2) so the C++
 //    controller receives fresh telemetry more frequently, reducing the open-loop
 //    interval during which physics can diverge from the plan.

@@ -3,11 +3,13 @@
 > **Project:** Control and Trajectory Tracking for Autonomous Vehicle  
 > **Simulator:** CARLA 0.9.16 · Town06_Opt  
 > **Vehicle:** Lincoln MKZ  
-> **Gains used:** Steering `Kp=0.05 Ki=0.0 Kd=0.05 limits=±0.3` · Throttle `Kp=0.10 Ki=0.001 Kd=0.05 limits=[-1.0, 1.0]`
+> **Gains used:** Steering `Kp=0.05  Ki=0.0  Kd=0.25  limits=±1.2 rad` · Throttle `Kp=0.3  Ki=0.05  Kd=0.0  limits=[−10, 10]`
 
 
 - [PID Controller — Project Answers](#pid-controller--project-answers)
   - [1. Plot Description](#1-plot-description)
+    - [Step 1 — Vehicle Spawned (PID not yet active)](#step-1--vehicle-spawned-pid-not-yet-active)
+    - [Step 4 — PID Performance Plots](#step-4--pid-performance-plots)
     - [Steering: Cross-Track Error (top-left)](#steering-cross-track-error-top-left)
     - [Steering: Output Command (top-right)](#steering-output-command-top-right)
     - [Throttle: Velocity Error (bottom-left)](#throttle-velocity-error-bottom-left)
@@ -26,6 +28,7 @@
   - [5. Potential Improvements (Optional)](#5-potential-improvements-optional)
 
 
+
 ---
 
 ## 1. Plot Description
@@ -40,31 +43,40 @@ The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town06_Opt
 
 ### Step 4 — PID Performance Plots
 
-The plots below capture **10,552 control iterations** (~700 m of driving, clearing all 3 parked NPCs without collision) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
+The plots below capture **3,761 control iterations** (~370 m of driving, clearing all 3 parked NPCs without collision) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
 
 ![PID Performance Plots](../pid_plots.png)
 
 ### Steering: Cross-Track Error (top-left)
 
-The CTE stays very close to zero on the straight Town06_Opt highway. Small spikes appear at each NPC detour where the motion planner shifts the reference path ~0.5 m north or south of road center to avoid the parked vehicle, then returns to center after clearing it. The vehicle successfully detoured around **all 3 parked NPCs** with the FSM remaining in `FOLLOW_LANE` (behavior=0) throughout the obstacle zone — no `DECEL_TO_STOP` was required.
+The CTE stays close to zero during straight highway driving. Three clearly-visible spike clusters correspond to the three NPC lane-change manoeuvres:
+
+| Event | Iterations | CTE range | Steer sign-flips |
+|-------|-----------|-----------|-----------------|
+| NPC0 avoidance (inner → outer lane) | 16 – 184   | −1.29 to −0.39 m | 19 |
+| NPC1 avoidance (outer → inner lane) | 1073 – 1262 | +0.13 to +1.25 m | 3  |
+| NPC2 avoidance (inner → outer lane) | 2291 – 2434 | −1.18 to −0.27 m | 8  |
+
+The CTE sign flips reveal which direction the car had to move: negative CTE = car is north of the goal (must steer south = outer lane); positive CTE = car is south of goal (must steer north = inner lane). The Python goal-ramp (0.05 m/frame) prevents sudden CTE jumps that would otherwise saturate the actuator — the output never reached the ±1.2 rad limit.
 
 | Statistic | Value |
 |-----------|-------|
-| Mean CTE  | +0.043 m |
-| Std dev   | 0.290 m |
-| Data rows | 10,552 |
+| Mean CTE  | +0.053 m |
+| Std dev   | 0.366 m |
+| Max \|CTE\| | 1.288 m (NPC0 onset) |
+| Data rows | 3,761 |
 
 ### Steering: Output Command (top-right)
 
-The steering command mirrors the CTE pattern — near-zero on straights, brief pulses at each NPC detour. All commands remain within the **±0.3 rad** saturation limits, confirming the gains do not saturate the actuator during normal highway driving.
+The steering command mirrors the CTE pattern — near-zero on straights, smooth pulses at each NPC detour. Peak command = **0.187 rad** (15.6 % of the ±1.2 rad limit). The exponential moving-average derivative filter (α=0.25) suppresses high-frequency jitter from spiral-waypoint recalculation, keeping the command smooth even during the 3.5 m lateral lane changes.
 
 ### Throttle: Velocity Error (bottom-left)
 
-The velocity error starts at **−3 m/s** (vehicle at rest vs. 3 m/s target), then stabilises near **−0.73 m/s** average — the Lincoln MKZ cruises at approximately 2.3 m/s under the 3 m/s reference. This under-speed is acceptable for the obstacle-avoidance task. The small `Ki=0.001` gradually closes the steady-state gap over longer runs.
+The velocity error starts at **−3.0 m/s** (vehicle at rest, 3 m/s target), then converges to near-zero within 200 frames. Steady-state error ≈ **−0.003 m/s** — the `Ki = 0.05` integral term has effectively eliminated the initial speed deficit. Transient spikes of ±0.1 m/s appear at each replanning cycle but are immediately corrected.
 
 ### Throttle/Brake Commands (bottom-right)
 
-Throttle holds steady around **0.41** for the majority of the run — well below the 1.0 hard cap. Brake is almost never engaged (< 1 activation in 6,626 frames), confirming the vehicle cruises at a stable speed without hunting. The `Kd = 0.0` choice for throttle prevents amplifying velocity sensor noise, producing this smooth, non-oscillating profile.
+Throttle holds steady at **0.383** average (well below the CARLA 1.0 physics cap). The opening burst reaches **0.908** (frames 0–50) as the vehicle accelerates from rest; it then settles into the cruise setpoint. Brake is **never applied** (0 frames with brake > 0.01) — the vehicle reached the 3 m/s cruise speed and maintained it without needing to slow down. With `Kd = 0.0` for throttle, there is no derivative amplification of velocity sensor noise.
 
 ---
 
@@ -72,15 +84,15 @@ Throttle holds steady around **0.41** for the majority of the run — well below
 
 ### Proportional — Kp
 
-Provides the primary corrective action, directly proportional to the current error. For **steering**, Kp snaps the vehicle toward the planned path; for **throttle**, Kp drives acceleration in proportion to the speed deficit. Setting Kp too high causes overshoot: with `Kp_throttle = 0.3` the controller issued `throttle = 0.9`, and the Lincoln MKZ reached 14+ m/s within one second — well past the 3 m/s target.
+Provides the primary corrective action, directly proportional to the current error. For **steering**, `Kp=0.05` snaps the vehicle toward the planned spiral path proportionally to the cross-track error; for **throttle**, `Kp=0.3` drives acceleration in proportion to the speed deficit. Setting Kp too high causes overshoot: with `Kp_throttle = 0.3` and no Kd, the initial throttle burst reached 0.908 (first frame: vel_err = −3 m/s) but the system settled quickly thanks to the falling velocity error reducing the P term naturally.
 
 ### Integral — Ki
 
-Eliminates persistent steady-state bias by accumulating the error over time. `Ki = 0` for steering prevents **integral windup** on rapidly-changing lateral errors in curves — if the vehicle briefly deviates to avoid an NPC, the integral would otherwise build a large bias that overshoots back. A small `Ki = 0.05` for throttle provides a gentle nudge toward the target speed over time, compensating for rolling resistance and road grade.
+Eliminates persistent steady-state bias by accumulating the error over time. `Ki = 0.0` for steering prevents **integral windup** through NPC detour manoeuvres — if the vehicle briefly deviates to avoid an obstacle, the integral would otherwise build a bias that overshoots back to centre after clearing it. `Ki = 0.05` for throttle proved critical: without it the vehicle cruised 0.7 m/s below the 3 m/s target; with it, steady-state velocity error converges to ≈ −0.003 m/s.
 
 ### Derivative — Kd
 
-Anticipates the trend of the error and opposes it proportionally to its rate of change. For **steering**, `Kd = 0.05` damps lateral oscillation: it detects the vehicle rotating toward the path and reduces the correction before overshoot occurs. The value was intentionally reduced from the reference `Kd = 0.25` because our CARLA 0.9.16 simulation runs at ~20 Hz (dt ≈ 0.05 s) vs. the reference Udacity VM at ~10 Hz (dt ≈ 0.1 s) — at 20 Hz, `Kd/dt` doubles, so halving Kd keeps the effective derivative gain constant. For **throttle**, `Kd = 0.0` is chosen to avoid amplifying velocity sensor noise into unnecessary brake/throttle chatter.
+Anticipates the trend of the error and opposes it proportionally to its rate of change. For **steering**, `Kd = 0.25` damps lateral oscillation by detecting the vehicle rotating toward the path and reducing the correction before overshoot occurs. An exponential moving-average filter (α=0.25) is applied to the raw derivative to suppress frame-to-frame spiral-waypoint jitter that the high `Kd/dt ≈ 7.5` gain would otherwise amplify into steer chatter. Without this filter, a single-frame 3.5 m CTE jump produced `d_error = 102` and saturated the output to the ±1.2 limit for 32 consecutive frames. For **throttle**, `Kd = 0.0` is chosen deliberately — the velocity signal from CARLA contains sensor noise that a derivative term would amplify into unnecessary throttle/brake chatter.
 
 ---
 
@@ -137,14 +149,20 @@ Use a Gaussian Process surrogate model to predict which gain triplet will minimi
 
 1. **Anti-windup clamping** — Freeze Ki accumulation whenever the output is saturated, preventing the integral from growing beyond what the actuators can physically deliver.
 
-2. **Gain scheduling** — Use a speed-indexed lookup table: higher Kp at low speed for precise parking maneuvers, lower Kp at highway speed to avoid oscillation.
+2. **Goal-ramp smoothing** — Already implemented: the lane-change target waypoint moves at 0.05 m/frame toward the new lane instead of jumping instantly. This prevents the derivative kick that previously caused 32 sign-flip oscillations over 8 m of travel.
 
-3. **Feedforward + PID** — Add a feedforward steering term derived from the planned path curvature:
+3. **Derivative EMA filter** — Already implemented (α=0.25): suppresses high-frequency CTE jitter without delaying response to genuine errors, keeping steer commands within 0.19 rad even during 3.5 m lane changes.
+
+4. **Gain scheduling** — Use a speed-indexed lookup table: higher Kp at low speed for precise manoeuvres, lower Kp at highway speed to avoid oscillation.
+
+5. **Feedforward + PID** — Add a feedforward steering term derived from the planned path curvature:
    ```
    steer_ff = wheelbase / radius_of_curvature
    ```
    The PID then only corrects the residual error, reducing steady-state lag.
 
-4. **Model Predictive Control (MPC)** — Optimise a control sequence over a receding horizon (e.g. 1 second), explicitly enforcing actuator limits and trajectory shape. MPC eliminates the lag inherent in pure reactive feedback and handles multi-objective trade-offs (comfort vs. tracking accuracy) in a principled way.
+6. **Model Predictive Control (MPC)** — Optimise a control sequence over a receding horizon (e.g. 1 second), explicitly enforcing actuator limits and trajectory shape. MPC eliminates the lag inherent in pure reactive feedback and handles multi-objective trade-offs (comfort vs. tracking accuracy) in a principled way.
 
-5. **Higher update rate** — Reduce `update_point_thresh` from 4 to 2, giving the C++ controller fresh telemetry more frequently and shrinking the open-loop interval during which CARLA physics can diverge from the planned trajectory.
+7. **Higher update rate** — Reduce `update_point_thresh` from 4 to 2, giving the C++ controller fresh telemetry more frequently and shrinking the open-loop interval during which CARLA physics can diverge from the planned trajectory.
+
+---
