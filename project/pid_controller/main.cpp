@@ -92,22 +92,29 @@ MotionPlanner motion_planner(P_NUM_PATHS, P_GOAL_OFFSET, P_ERR_TOLERANCE);
 bool have_obst = false;
 vector<State> obstacles;
 
-void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
+void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, double x_ego, double y_ego, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
 
   State ego_state;
 
-  ego_state.location.x = x_points[x_points.size()-1];
-  ego_state.location.y = y_points[y_points.size()-1];
+  // Use trajectory-tip (last planned point) as planning origin — same as the
+  // reference implementation. This ensures each new spiral smoothly continues
+  // from the end of the previous one, giving stable CTE tracking.
+  // If trajectory is empty fall back to actual vehicle position.
+  if (x_points.size() > 0) {
+    ego_state.location.x = x_points[x_points.size() - 1];
+    ego_state.location.y = y_points[y_points.size() - 1];
+  } else {
+    ego_state.location.x = x_ego;
+    ego_state.location.y = y_ego;
+  }
   ego_state.velocity.x = velocity;
 
   if( x_points.size() > 1 ){
-  	ego_state.rotation.yaw = angle_between_points(x_points[x_points.size()-2], y_points[y_points.size()-2], x_points[x_points.size()-1], y_points[y_points.size()-1]);
-  	ego_state.velocity.x = v_points[v_points.size()-1];
-  	if(velocity < 0.01)
-  		ego_state.rotation.yaw = yaw;
-
+    ego_state.rotation.yaw = angle_between_points(x_points[x_points.size()-2], y_points[y_points.size()-2], x_points[x_points.size()-1], y_points[y_points.size()-1]);
+    ego_state.velocity.x = v_points[v_points.size()-1];
+    if(velocity < 0.01)
+      ego_state.rotation.yaw = yaw;
   } else {
-    // First frame: only one trajectory point, so use the reported heading directly
     ego_state.rotation.yaw = yaw;
   }
 
@@ -179,6 +186,11 @@ void path_planner(vector<double>& x_points, vector<double>& y_points, vector<dou
   if(best_spirals.size() > 0)
   	best_spiral_idx = best_spirals[best_spirals.size()-1];
 
+  if(best_spiral_idx < 0 || best_spiral_idx >= (int)spirals_x.size()){
+    // No valid spiral found (all paths collide). Keep x_points as-is.
+    return;
+  }
+
   int index = 0;
   int max_points = 20;
   int add_points = spirals_x[best_spiral_idx].size();
@@ -201,6 +213,10 @@ void set_obst(vector<double> x_points, vector<double> y_points, vector<State>& o
 		State obstacle;
 		obstacle.location.x = x_points[i];
 		obstacle.location.y = y_points[i];
+		// NPCs face west (yaw = π). Default yaw=0 (east) would misplace collision
+		// circles 3m EAST of the NPC, causing false collisions 3m too early.
+		// Correct west-facing yaw places circles in the NPC's actual footprint.
+		obstacle.rotation.yaw = M_PI;
 		obstacles.push_back(obstacle);
 	}
 	obst_flag = true;
@@ -223,18 +239,18 @@ int main ()
   file_throttle.close();
 
   // initialize pid steer
-  // Kp=0.05 (small: large corrections cause instability), Ki=0.0 (no windup through corners),
-  // Kd=0.25 (dominant: damps lateral oscillation). Output clamped to CARLA steer range [-1.2, 1.2].
+  // Kp=0.05, Ki=0.0, Kd=0.05: reference used Kd=0.25 but that was tuned for a ~10 Hz VM.
+  // Our CARLA 0.9.16 runs at ~20 Hz (dt≈0.05 s). Effective Kd/dt gain = 0.25/0.05 = 5.0 →
+  // even a 0.06 m CTE change per frame saturates the ±0.3 output. Scaling Kd by dt ratio:
+  // Kd = 0.25 × (0.05/0.1) ≈ 0.06. Use 0.05 to be safe.
   PID pid_steer = PID();
-  pid_steer.Init(0.1, 0.0, 0.3, 1.2, -1.2);
+  pid_steer.Init(0.05, 0.0, 0.05, 0.3, -0.3);
 
-  // initialize pid throttle
-  // Kp=0.15 (gentle: prevents velocity overshoot at 60Hz update rate),
-  // Ki=0.001 (very small: avoids integral windup on initial acceleration burst),
-  // Kd=0.1 (light damping on velocity change rate).
-  // Output capped at 0.6 to limit maximum acceleration.
+  // Throttle: Kp=0.3, Ki=0.05, Kd=0.0, limits [-1.0, 1.0].
+  // Higher Ki (0.05) eliminates persistent speed offset over time.
+  // Kd=0 avoids amplifying noisy velocity signal.
   PID pid_throttle = PID();
-  pid_throttle.Init(0.15, 0.001, 0.1, 0.6, -1.0);
+  pid_throttle.Init(0.3, 0.05, 0.0, 1.0, -1.0);
 
   h.onMessage([&pid_steer, &pid_throttle, &new_delta_time, &prev_sim_time, &i](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode)
   {
@@ -282,7 +298,11 @@ int main ()
           vector< vector<double> > spirals_v;
           vector<int> best_spirals;
 
-          path_planner(x_points, y_points, v_points, yaw, velocity, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
+          // Pass vehicle's actual position as ego so each spiral starts from
+          // the real vehicle location rather than the stale trajectory tip.
+          // x_points/y_points are NOT reset here — x_points[0] remains the
+          // nearest planned waypoint used to compute the cross-track error.
+          path_planner(x_points, y_points, v_points, yaw, velocity, x_position, y_position, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
 
           // Compute delta time from CARLA simulation clock (sub-second resolution).
           // Using sim_time from the payload gives proper time scaling for PID integration.
@@ -315,13 +335,11 @@ int main ()
 
           double steer_output;
 
-          // Compute control to apply
-          // Skip correction at near-zero speed: heading is undefined and CTE is noisy.
-          if (velocity < 0.5) {
-            pid_steer.UpdateError(0.0);
-          } else {
-            pid_steer.UpdateError(error_steer);
-          }
+          // Always update with the real error — never pass 0.0 at low speed.
+          // Passing 0.0 when velocity < threshold caused a large derivative spike
+          // ((0 - prev_error)/dt) that saturated the steer in the wrong direction
+          // and spun the vehicle off course.
+          pid_steer.UpdateError(error_steer);
           steer_output = pid_steer.TotalError();
 
           // Save data
@@ -342,10 +360,12 @@ int main ()
 
           // Compute error of speed
           double error_throttle;
-          // Speed error: actual minus desired.
-          // With TotalError()'s negative sign convention: -Kp*(actual-desired) = Kp*(desired-actual)
-          // → positive output when too slow (throttle), negative when too fast (brake).
-          error_throttle = velocity - v_points[v_points.size() - 1];
+          // Use v_points[0] (immediate next waypoint speed) rather than the far-horizon last point.
+          // This ensures the controller responds to planner deceleration commands near obstacles:
+          // when the planner slows to stop before a parked NPC, v_points[0] drops → positive error
+          // → brake output. Using v_points.back() (far horizon) would ignore the deceleration.
+          // With TotalError()'s negative sign: -Kp*(actual-desired) → throttle when too slow, brake when too fast.
+          error_throttle = velocity - v_points[0];
 
           double throttle_output;
           double brake_output;

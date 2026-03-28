@@ -126,7 +126,9 @@ def get_actor_display_name(actor, truncate=250):
 def magnitude(vector):
     return math.sqrt(vector.x*vector.x+vector.y*vector.y+vector.z*vector.z)
 
-def distance_lookahead(velocity_mag, accel_mag, time=1.5, min_distance=8.0, max_distance=20.0):
+def distance_lookahead(velocity_mag, accel_mag, time=1.5, min_distance=20.0, max_distance=30.0):
+    # Minimum 20 m: gives the spiral planner enough forward distance to make
+    # gradual lateral corrections back to road centre without exceeding max curvature.
     return max( min(velocity_mag * time + 0.5 * accel_mag * time * time, max_distance), min_distance)
 
 
@@ -181,10 +183,14 @@ class World(object):
 
             return point.x, point.y, waypoint.transform.rotation.yaw * math.pi/180, False
 
-        waypoint = waypoint.next(distance_lookahead(magnitude(self.player.get_velocity() ), magnitude(self.player.get_acceleration() ) ))[0]
+        nexts = waypoint.next(distance_lookahead(magnitude(self.player.get_velocity() ), magnitude(self.player.get_acceleration() ) ))
+        if not nexts:
+            # No next waypoint (road end or topology gap): hold current goal
+            return waypoint.transform.location.x, waypoint.transform.location.y, waypoint.transform.rotation.yaw * math.pi/180, False
+        waypoint = nexts[0]
         point = waypoint.transform.location
 
-        not_junction = [475, 1168, 82, 1932]
+        not_junction = [475, 1168, 82, 1932, 1203]
 
         _tl_state = 'none'
 
@@ -774,7 +780,9 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
     SpawnActor = carla.command.SpawnActor
     blueprint = client.get_world().get_blueprint_library().filter(args.filter)[5]
     actor_spawn =  carla.Transform()
-    spawn_point = world.map.get_spawn_points()[1]
+    # Use spawn_points[4] to match the player's spawn location so NPCs are
+    # placed 30/65/110m ahead of the vehicle (same anchor as player spawn).
+    spawn_point = world.map.get_spawn_points()[4]
     actor_spawn.location = spawn_point.location
     actor_spawn.rotation = spawn_point.rotation
     actor_spawn.location.x += offset_x * spawn_point.get_forward_vector().x
@@ -797,8 +805,21 @@ async def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
-        client.set_timeout(2.0)
+        client.set_timeout(60.0)
         print("[TRACE] CARLA client created", flush=True)
+
+        # Ensure Town06_Opt is loaded. If CARLA was started with it pre-loaded, skip
+        # the load_world call to avoid RPC timeout/crash on some drivers.
+        print("[TRACE] Checking current map...", flush=True)
+        _current_map = client.get_world().get_map().name
+        print(f"[TRACE] Current map: {_current_map}", flush=True)
+        if 'Town06' not in _current_map:
+            print("[TRACE] Loading Town06_Opt...", flush=True)
+            client.load_world('Town06_Opt')
+            import time as _time; _time.sleep(5)
+            print("[TRACE] Town06_Opt loaded", flush=True)
+        else:
+            print("[TRACE] Town06_Opt already loaded, skipping load_world", flush=True)
 
         display = pygame.display.set_mode(
             (args.width, args.height),
@@ -817,9 +838,13 @@ async def game_loop(args):
 
         # Spawn some obstacles to avoid
         batch = []
-        batch.append(SpawnNPC(client, world, args, 30, 1.5))
-        batch.append(SpawnNPC(client, world, args, 65, -3 *1.5))
-        batch.append(SpawnNPC(client, world, args, 110, -1 * 1.5))
+        # Place NPCs 2.5 m south of road centre (y ≈ -12.5, lane -4).
+        # With CIRCLE_RADII=1.5 m the 3 m exclusion zone only blocks paths
+        # south of y=-9.5, leaving the y=-9 north-detour path collision-free
+        # while keeping the vehicle safely within lane -3 (y=-8.25 to -11.75).
+        batch.append(SpawnNPC(client, world, args, 30, 2.5))
+        batch.append(SpawnNPC(client, world, args, 65, 2.5))
+        batch.append(SpawnNPC(client, world, args, 110, 2.5))
 
         for response in carla.Client.apply_batch_sync(client, batch):
             if response.error:
@@ -854,17 +879,40 @@ async def game_loop(args):
                 x_points = [point.location.x for point in way_points]
                 y_points = [point.location.y for point in way_points]
                 yaw = way_points[0].rotation.yaw * math.pi / 180
-                waypoint_x, waypoint_y, waypoint_t, waypoint_j = world.get_waypoint(x_points[-1], y_points[-1])
-                real_v = world.player.get_velocity()
-                velocity = math.sqrt(real_v.x**2 + real_v.y**2)
-                print('velocity sent: ', velocity)
 
+                # Get vehicle's actual transform first so we can use its position
+                # for the goal waypoint query. Using x_points[-1] (trajectory end)
+                # causes the goal to fall behind the vehicle when spirals fail and
+                # the trajectory drains, creating a vicious cycle of spiral failures.
                 t = world.player.get_transform()
                 location_x = t.location.x
                 location_y = t.location.y
                 location_z = t.location.z
+                # Compute vehicle heading now so it's available for the lane-guard below.
+                vehicle_yaw_rad = t.rotation.yaw * math.pi / 180
 
-                ws.send(json.dumps({'traj_x': x_points, 'traj_y': y_points, 'traj_v': v_points ,'yaw': _prev_yaw, "velocity": velocity, 'time': sim_time, 'waypoint_x': waypoint_x, 'waypoint_y': waypoint_y, 'waypoint_t': waypoint_t, 'waypoint_j': waypoint_j, 'tl_state': _tl_state, 'obst_x': obst_x, 'obst_y': obst_y, 'location_x': location_x, 'location_y': location_y, 'location_z': location_z } ))
+                # Always query from vehicle's current position: guarantees the
+                # goal lookahead is ahead of the vehicle regardless of trajectory state.
+                waypoint_x, waypoint_y, waypoint_t, waypoint_j = world.get_waypoint(location_x, location_y)
+
+                # Defensive: if the snapped waypoint is pointing the wrong way
+                # (>90° from vehicle heading), we likely snapped onto a parallel
+                # lane going the opposite direction (e.g., eastbound when we want
+                # westbound). In that case, project forward 20 m in the vehicle's
+                # own heading and re-snap — this keeps us on the correct lane.
+                yaw_diff = abs(waypoint_t - vehicle_yaw_rad)
+                while yaw_diff > math.pi:
+                    yaw_diff = abs(yaw_diff - 2 * math.pi)
+                if yaw_diff > math.pi / 2:
+                    fwd_x = location_x + 20.0 * math.cos(vehicle_yaw_rad)
+                    fwd_y = location_y + 20.0 * math.sin(vehicle_yaw_rad)
+                    waypoint_x, waypoint_y, waypoint_t, waypoint_j = world.get_waypoint(fwd_x, fwd_y)
+                    print(f'[WARN] wrong-lane snap corrected: fwd_snap=({fwd_x:.1f},{fwd_y:.1f})')
+                real_v = world.player.get_velocity()
+                velocity = math.sqrt(real_v.x**2 + real_v.y**2)
+                print('velocity sent: ', velocity)
+                print(f'[DBG] sending yaw={vehicle_yaw_rad:.4f} rad ({t.rotation.yaw:.1f} deg) x={location_x:.2f} y={location_y:.2f}')
+                ws.send(json.dumps({'traj_x': x_points, 'traj_y': y_points, 'traj_v': v_points ,'yaw': vehicle_yaw_rad, "velocity": velocity, 'time': sim_time, 'waypoint_x': waypoint_x, 'waypoint_y': waypoint_y, 'waypoint_t': waypoint_t, 'waypoint_j': waypoint_j, 'tl_state': _tl_state, 'obst_x': obst_x, 'obst_y': obst_y, 'location_x': location_x, 'location_y': location_y, 'location_z': location_z } ))
 
             clock.tick_busy_loop(60)
             world.tick(clock)
@@ -874,8 +922,10 @@ async def game_loop(args):
             pygame.display.flip()
 
     except Exception as error:
+        import traceback
         print('EXCEPTION IN GAME LOOP:')
         print(error)
+        traceback.print_exc()
 
     finally:
 

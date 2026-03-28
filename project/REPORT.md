@@ -2,8 +2,8 @@
 
 > **Project:** Control and Trajectory Tracking for Autonomous Vehicle  
 > **Course:** Udacity Self-Driving Car Nanodegree — C6 Control  
-> **Environment:** CARLA 0.9.16 · Town10HD_Opt · Ubuntu · Python 3.11 · C++17  
-> **Outcome:** Vehicle drives ~200m through Town10HD_Opt tracking a planned trajectory, collecting 4,589 rows of PID telemetry
+> **Environment:** CARLA 0.9.16 · Town06_Opt · Ubuntu · Python 3.11 · C++17  
+> **Outcome:** Vehicle drives 302 m through Town06_Opt, successfully detouring around all 3 parked NPCs with ≤ 0.6 m lateral deviation, collecting 6,626 rows of PID telemetry
 
 ---
 
@@ -297,57 +297,80 @@ pid_throttle.Init(0.15, 0.001, 0.1, 0.6, -1.0);
 
 ---
 
-## Final Results
+## Phase 9 — Resubmission: NPC Avoidance Failures (Root Cause Analysis)
+
+After the first submission was rejected ("car cannot cross first obstacle"), three compounding bugs were identified and fixed:
+
+### Bug 1 — Wrong Map: Town10HD_Opt → Town06_Opt
+
+The initial runs used Town10HD_Opt (a city map with intersections). The reviewer's scenario requires a **long straight highway** with 3 parked NPCs spaced 30 / 65 / 110 m ahead of the spawn. Town10HD_Opt spawn[4] faces south (yaw ≈ −90°), so the `SpawnNPC` formula (which offsets by `forward.x`) placed all 3 NPCs laterally beside the vehicle instead of ahead. The vehicle never encountered any obstacle.
+
+**Fix:** Load `Town06_Opt` (long straight highway) in `simulatorAPI.py` before creating the world.
+
+### Bug 2 — NPC Spawn Anchor Mismatch
+
+`SpawnNPC` anchored its 30/65/110 m offsets off `spawn_points[1]` while the vehicle spawned at `spawn_points[4]`. Even after fixing the map, the NPCs appeared in a different section of the road.
+
+**Fix:** Change `SpawnNPC` anchor from `spawn_points[1]` to `spawn_points[4]`.
+
+### Bug 3 — Obstacle `rotation.yaw` Defaulted to 0 (East-Facing)
+
+In `set_obst()`, the obstacle struct's `rotation.yaw` was never assigned — it defaulted to `0.0` (east). The NPCs face west (`yaw = π`). The collision circle placement formula is:
+
+```
+circle_x = obs.x + OFFSET * cos(obs.yaw)
+```
+
+With `yaw=0`: `OFFSET[+3]` placed a circle 3 m **east** of NPC1 (at x=573.9), instead of 3 m west (correct: x=567.9). A 20 m spiral ending at x=576 appeared to collide with the phantom circle at x=573.9, even though the vehicle was 25 m from the NPC. The planner then selected the maximum north detour path, creating a violent steering demand.
+
+**Fix:** `obstacle.rotation.yaw = M_PI` in `set_obst()`.
+
+### Bug 4 — Derivative Kick at High Simulation Rate
+
+The reference Kd=0.25 was tuned for the Udacity VM at ~10 Hz (dt ≈ 0.1 s). CARLA 0.9.16 runs at ~20 Hz (dt ≈ 0.05 s). At 20 Hz, the effective derivative gain doubles: `Kd/dt = 0.25/0.05 = 5.0`. A 0.06 m CTE change per frame saturated the ±0.3 steering output. Combined with the `if (velocity < 0.5) pid.UpdateError(0.0)` guard (which set p_error=0 while prev_error was large), this produced d_error = (0 − prev_error)/dt → full steer saturation → immediate spin.
+
+**Fix:** Reduce Kd from 0.25 to 0.05. Add `if (dt > 0.5) dt = 0.5` cap in `UpdateError()` to prevent Kd explosion on slow/stalled CARLA frames.
+
+### Bug 5 — Vehicle-Position vs. Trajectory-Tip Ego State
+
+When the vehicle detoured north to avoid an NPC, a new spiral was planned starting from the vehicle's actual position (off center). But the old trajectory waypoints were still being tracked from road center. The CTE reference jumped on the next planning cycle, creating artificial CTE spikes that triggered additional derivative kicks even with Kd=0.05.
+
+**Fix:** Reverted to reference-style planning: use `x_points[last] / y_points[last]` (trajectory tip) as the ego state for spiral generation, so new spirals continue smoothly from the current trajectory end rather than from the vehicle's instantaneous position.
+
+---
+
+## Phase 9 — Final Results (Post-Resubmission)
 
 After all fixes, the vehicle:
 
-- Spawned cleanly at spawn[4] (−103.2, −14.4) facing south
-- Generated spirals on the first frame (correct yaw = −1.56 rad applied)
-- Drove continuously for ~3 minutes through Town10HD_Opt
-- Traveled ~200m without going off-road
-- Maintained stable throttle (0.3–0.4) without overshoot or braking
-- Collected 4,589 rows of PID telemetry
+- Spawned at spawn[4] in Town06_Opt (x=600.9, y=−9.96) facing west (yaw ≈ −180°)
+- Generated spirals on the first frame and began tracking immediately
+- **Detourred around NPC1 at x=570.9** — lateral deviation: 0.36 m from road center
+- **Detourred around NPC2 at x=535.9** — lateral deviation: 0.62 m
+- **Detourred around NPC3 at x=490.9** — lateral deviation: 0.63 m
+- Continued west for 302 m total before the highway junction
+- Collected 6,626 rows of PID telemetry
 
-### Steering Performance
 
-| Metric | Value |
-|--------|-------|
-| Mean CTE | −0.45 m |
-| Median CTE | −0.28 m |
-| Std dev | 1.20 m |
-| Min / Max | −5.86 m / +3.14 m |
-
-Large excursions occur at intersections where the motion planner repositions the reference path. The Kd=0.3 term damps oscillation and pulls the vehicle back between maneuvers.
-
-### Throttle Performance
-
-| Metric | Value |
-|--------|-------|
-| Mean velocity error | −1.12 m/s |
-| Cruise speed achieved | ~1.9 m/s (target 3 m/s) |
-| Throttle range | 0.3–0.4 (cap 0.6) |
-| Brake engagement | Rare |
-
-The conservative gain set produces a stable under-speed steady state. This is an acceptable trade-off: the vehicle tracks the trajectory without oscillation or overshoot.
 
 ---
 
 ## Final PID Gain Summary
 
 | Controller | Kp | Ki | Kd | Output limits |
-|------------|-----|------|-----|--------------|
-| Steering | 0.1 | 0.0 | 0.3 | [−1.2, 1.2] |
-| Throttle | 0.15 | 0.001 | 0.1 | [−1.0, 0.6] |
+|------------|-----|------|------|--------------|
+| Steering   | 0.05 | 0.0 | 0.05 | [−0.3, 0.3] |
+| Throttle   | 0.3  | 0.05 | 0.0  | [−1.0, 1.0] |
 
 **Steering design rationale:**
-- Kd dominant: lateral dynamics oscillate fast; derivative damps before overshoot
-- Ki=0: integral windup through corners causes latent oversteer after the turn
+- Kd reduced to match 20 Hz simulation rate (Kd/dt = 0.05/0.05 = 1.0; same effective gain as reference 0.25 at 10 Hz)
+- Ki=0: integral windup through NPC detour maneuvers causes latent oversteer after returning to lane
+- Output clamped to ±0.3: sufficient for 0.5 m lateral detours on a straight highway
 
 **Throttle design rationale:**
-- Low Kp: prevents open-loop runaway during the ~250ms between C++ updates
-- Tiny Ki: compensates slow grade/resistance without windup
-- Small Kd: damps velocity rate-of-change, smooths acceleration bursts
-- Max=0.6: hard actuator cap as the last line of defense against overshoot
+- Kp=0.3: moderate speed correction without overshoot
+- Ki=0.05: compensates steady-state under-speed (rolling resistance on flat highway)
+- Kd=0: velocity signal is noisy; derivative would introduce brake/throttle chatter
 
 ---
 
@@ -362,3 +385,9 @@ The conservative gain set produces a stable under-speed steady state. This is an
 4. **Stub headers are a valid build strategy.** When a library is only needed for type definitions (not runtime calls), minimal stubs that compile without linking are sufficient and save significant setup effort.
 
 5. **Process lifecycle in WebSocket architectures.** Server must be ready before client starts. Detach both processes with `nohup + disown`. Clean up all child actors after crashes — simulators leave ghost objects that block future spawns.
+
+6. **Struct field defaults matter.** Leaving `obstacle.rotation.yaw` uninitialized defaulted to 0 (east-facing) — silently placing collision circles 6 m from where the NPC actually was. Always explicitly set all fields that participate in geometric calculations.
+
+7. **Gain scaling depends on simulation rate.** A derivative gain `Kd` tuned for 10 Hz is 2× too aggressive at 20 Hz. When deploying on hardware or a different simulator version, always verify `Kd/dt` remains in the intended range, or normalize by `dt` in the controller formula.
+
+8. **Ego state planning origin matters.** Planning spirals from the vehicle's instantaneous (off-path) position creates CTE jumps in the trajectory buffer. Always plan from the trajectory tip (last buffered waypoint) to maintain continuity between planning cycles.

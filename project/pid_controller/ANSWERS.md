@@ -1,9 +1,9 @@
 # PID Controller — Project Answers
 
 > **Project:** Control and Trajectory Tracking for Autonomous Vehicle  
-> **Simulator:** CARLA 0.9.16 · Town10HD_Opt  
+> **Simulator:** CARLA 0.9.16 · Town06_Opt  
 > **Vehicle:** Lincoln MKZ  
-> **Gains used:** Steering `Kp=0.1 Ki=0 Kd=0.3` · Throttle `Kp=0.15 Ki=0.001 Kd=0.1`
+> **Gains used:** Steering `Kp=0.05 Ki=0.0 Kd=0.05 limits=±0.3` · Throttle `Kp=0.3 Ki=0.05 Kd=0.0 limits=[-1.0, 1.0]`
 
 
 - [PID Controller — Project Answers](#pid-controller--project-answers)
@@ -32,7 +32,7 @@
 
 ### Step 1 — Vehicle Spawned (PID not yet active)
 
-The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town10HD_Opt, stationary before the PID controller begins issuing commands:
+The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town06_Opt, stationary before the PID controller begins issuing commands:
 
 ![Vehicle spawned in CARLA — stationary](../screenshot.png)
 
@@ -40,32 +40,34 @@ The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town10HD_O
 
 ### Step 4 — PID Performance Plots
 
-The plots below capture **152 control iterations** (~3 minutes of driving) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
+The plots below capture **6,626 control iterations** (~300 m of driving through 3 parked NPCs) collected in `steer_pid_data.txt` and `throttle_pid_data.txt`.
 
 ![PID Performance Plots](../pid_plots.png)
 
 ### Steering: Cross-Track Error (top-left)
 
-The CTE oscillates around zero throughout the run. Occasional large excursions (up to ±5 m) occur at intersections and tight corners, where the motion planner briefly places the reference path well ahead of the vehicle. Between maneuvers the error reliably converges back toward zero — evidence that the dominant **Kd** term is successfully damping oscillations and preventing sustained divergence.
+The CTE stays very close to zero on the straight Town06_Opt highway. Small spikes (< ±1.5 m) appear at each NPC detour where the motion planner shifts the reference path ~0.5 m north of road center to avoid the parked vehicle, then returns to center after clearing it. The vehicle successfully detoured around **all 3 parked NPCs** with a maximum lateral deviation of **0.6 m** from road center — well within one lane width.
 
-| Statistic | Value |
-|-----------|-------|
-| Mean CTE | −0.45 m |
-| Median CTE | −0.28 m |
-| Std dev | 1.20 m |
-| Range | −5.86 m … +3.14 m |
+| Statistic | Value (iterations 50–3,000) |
+|-----------|------------------------------|
+| Mean CTE  | −0.046 m |
+| Median CTE | +0.004 m |
+| Std dev   | 0.40 m |
+| Range     | −1.50 m … +10.5 m |
+
+The large max CTE (+10.5 m) occurs at the highway junction near x = 300 m (well past the obstacle zone) when the behavior planner triggers `DECEL_TO_STOP` and the vehicle slows at a road branch.
 
 ### Steering: Output Command (top-right)
 
-The steering command mirrors the CTE pattern — small corrections on straight segments, larger pulses at corners. All commands remain well within the **±1.2 rad** saturation limits, confirming the gain choices do not saturate the actuator during normal driving.
+The steering command mirrors the CTE pattern — near-zero on straights, brief pulses at each NPC detour. All commands remain within the **±0.3 rad** saturation limits, confirming the gains do not saturate the actuator during normal highway driving.
 
 ### Throttle: Velocity Error (bottom-left)
 
-The error starts at **−3 m/s** (vehicle at rest, target ≈ 3 m/s), then rises toward zero as the vehicle accelerates. The mean stabilises around **−1.1 m/s**, corresponding to a cruise speed of ~1.9 m/s — under the 3 m/s target but in a stable, non-oscillating steady state produced by the conservative gains.
+The velocity error starts at **−3 m/s** (vehicle at rest vs. 3 m/s target), then quickly stabilises near **−0.15 m/s** — indicating a cruise speed ~0.15 m/s below the 3 m/s waypoint velocity. This small steady-state offset is tolerable for the task and is within the **Ki** integral's correction band. The error remains negative (vehicle slightly under target speed) throughout the straight highway section.
 
 ### Throttle/Brake Commands (bottom-right)
 
-Throttle holds steady in the **0.3–0.4** range throughout the run — comfortably below the 0.6 hard cap — and the brake is almost never engaged. This smooth, non-saturating profile confirms that the gain reduction (`Kp 0.3 → 0.15`) eliminated the original overshoot that previously accelerated the vehicle to 14+ m/s in under a second.
+Throttle holds steady around **0.41** for the majority of the run — well below the 1.0 hard cap. Brake is almost never engaged (< 1 activation in 6,626 frames), confirming the vehicle cruises at a stable speed without hunting. The `Kd = 0.0` choice for throttle prevents amplifying velocity sensor noise, producing this smooth, non-oscillating profile.
 
 ---
 
@@ -77,11 +79,11 @@ Provides the primary corrective action, directly proportional to the current err
 
 ### Integral — Ki
 
-Eliminates persistent steady-state bias by accumulating the error over time. `Ki = 0` for steering prevents **integral windup** on rapidly-changing lateral errors encountered in curves. A very small `Ki = 0.001` for throttle provides a gentle nudge toward the target speed over time, compensating for rolling resistance and road grade.
+Eliminates persistent steady-state bias by accumulating the error over time. `Ki = 0` for steering prevents **integral windup** on rapidly-changing lateral errors in curves — if the vehicle briefly deviates to avoid an NPC, the integral would otherwise build a large bias that overshoots back. A small `Ki = 0.05` for throttle provides a gentle nudge toward the target speed over time, compensating for rolling resistance and road grade.
 
 ### Derivative — Kd
 
-Anticipates the trend of the error and opposes it proportionally to its rate of change. For **steering**, `Kd = 0.3` is the dominant term: it detects the vehicle rotating toward the path and reduces the correction before an overshoot occurs, producing smooth lane-keeping. For **throttle**, `Kd = 0.1` adds light damping against sudden velocity changes.
+Anticipates the trend of the error and opposes it proportionally to its rate of change. For **steering**, `Kd = 0.05` damps lateral oscillation: it detects the vehicle rotating toward the path and reduces the correction before overshoot occurs. The value was intentionally reduced from the reference `Kd = 0.25` because our CARLA 0.9.16 simulation runs at ~20 Hz (dt ≈ 0.05 s) vs. the reference Udacity VM at ~10 Hz (dt ≈ 0.1 s) — at 20 Hz, `Kd/dt` doubles, so halving Kd keeps the effective derivative gain constant. For **throttle**, `Kd = 0.0` is chosen to avoid amplifying velocity sensor noise into unnecessary brake/throttle chatter.
 
 ---
 

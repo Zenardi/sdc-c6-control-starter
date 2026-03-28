@@ -38,8 +38,11 @@ void PID::UpdateError(double cte) {
     // P error: current cross-track error
     _p_error = cte;
 
-    // Guard: use dt=1 on first call (delta_time not yet set) to avoid divide-by-zero
+    // Guard: use dt=1 on first call (delta_time not yet set) to avoid divide-by-zero.
+    // Also cap dt to 0.5 s: a very large dt (e.g. when CARLA renders a slow frame)
+    // amplifies d_error = Δe/dt, which can saturate the output in the wrong direction.
     double dt = (_new_delta_time > 0.0) ? _new_delta_time : 1.0;
+    if (dt > 0.5) dt = 0.5;
 
     // D error: rate of change of CTE (smooths correction, reduces overshoot)
     _d_error = (cte - previous_p_error) / dt;

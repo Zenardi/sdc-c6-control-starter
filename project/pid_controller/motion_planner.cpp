@@ -31,12 +31,11 @@ State MotionPlanner::get_goal_state_in_ego_frame(const State& ego_state,
   auto cos_theta = std::cos(theta_rad);
   auto sin_theta = std::sin(theta_rad);
 
-  goal_state_ego_frame.location.x =
-      cos_theta * goal_state_ego_frame.location.x -
-      sin_theta * goal_state_ego_frame.location.y;
-  goal_state_ego_frame.location.y =
-      sin_theta * goal_state_ego_frame.location.x +
-      cos_theta * goal_state_ego_frame.location.y;
+  // Save originals before rotating to avoid using modified x in y calculation
+  auto dx = goal_state_ego_frame.location.x;
+  auto dy = goal_state_ego_frame.location.y;
+  goal_state_ego_frame.location.x = cos_theta * dx - sin_theta * dy;
+  goal_state_ego_frame.location.y = sin_theta * dx + cos_theta * dy;
 
   // Compute the goal yaw in the local frame by subtracting off the
   // current ego yaw from the goal waypoint heading/yaw.
