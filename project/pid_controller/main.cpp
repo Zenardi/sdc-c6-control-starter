@@ -92,26 +92,27 @@ MotionPlanner motion_planner(P_NUM_PATHS, P_GOAL_OFFSET, P_ERR_TOLERANCE);
 bool have_obst = false;
 vector<State> obstacles;
 
-void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
+void path_planner(vector<double>& x_points, vector<double>& y_points, vector<double>& v_points, double yaw, double velocity, double x_veh, double y_veh, State goal, bool is_junction, string tl_state, vector< vector<double> >& spirals_x, vector< vector<double> >& spirals_y, vector< vector<double> >& spirals_v, vector<int>& best_spirals){
 
   State ego_state;
 
-  // Use trajectory tip as planning origin so spirals are generated from the
-  // leading edge of the current plan. This prevents spiral deadlock near parked
-  // NPCs: the trajectory has already navigated around the obstacle, so new
-  // spirals start from beyond it and do not trigger collision detection on entry.
-  ego_state.location.x = x_points[x_points.size()-1];
-  ego_state.location.y = y_points[y_points.size()-1];
+  // Always plan from the vehicle's actual position so spirals have maximum
+  // room to route around obstacles.  Using the trajectory tip caused deadlock:
+  // when the tip was within the obstacle's collision zone, every spiral's first
+  // point triggered a collision and the trajectory was never updated.
+  ego_state.location.x = x_veh;
+  ego_state.location.y = y_veh;
   ego_state.velocity.x = velocity;
+  ego_state.rotation.yaw = yaw;
 
-  if( x_points.size() > 1 ){
-    ego_state.rotation.yaw = angle_between_points(x_points[x_points.size()-2], y_points[y_points.size()-2], x_points[x_points.size()-1], y_points[y_points.size()-1]);
-    ego_state.velocity.x = v_points[v_points.size()-1];
-    if(velocity < 0.01)
-      ego_state.rotation.yaw = yaw;
-  } else {
-    ego_state.rotation.yaw = yaw;
-  }
+  // Rebuild trajectory from vehicle position — discard stale tip-forward
+  // waypoints that may have drifted close to the obstacle.
+  x_points.clear();
+  y_points.clear();
+  v_points.clear();
+  x_points.push_back(x_veh);
+  y_points.push_back(y_veh);
+  v_points.push_back(velocity);
 
   Maneuver behavior = behavior_planner.get_active_maneuver();
 
@@ -181,12 +182,31 @@ void path_planner(vector<double>& x_points, vector<double>& y_points, vector<dou
   if(best_spirals.size() > 0)
   	best_spiral_idx = best_spirals[best_spirals.size()-1];
 
+  // Debug: show which spiral was chosen and where its midpoint is
+  {
+    static int pp_dbg = 0;
+    if (pp_dbg++ % 20 == 0 || (best_spiral_idx >= 0 && (int)spirals_x[best_spiral_idx].size() > 1 && fabs(spirals_y[best_spiral_idx].back() - ego_state.location.y) > 0.5)) {
+      int n = (best_spiral_idx >= 0) ? (int)spirals_x[best_spiral_idx].size() : 0;
+      double end_y = (n > 0) ? spirals_y[best_spiral_idx][n-1] : 0;
+      cout << "[PP] best_idx=" << best_spiral_idx << "/" << (int)spirals.size()
+           << " ego_y=" << ego_state.location.y
+           << " goal_y=" << goal.location.y
+           << " spiral_end_y=" << end_y
+           << " obs=" << obstacles.size()
+           << endl;
+    }
+  }
+
   if(best_spiral_idx < 0 || best_spiral_idx >= (int)spirals_x.size()){
     // No valid spiral found (all paths collide). Keep x_points as-is.
     return;
   }
 
-  int index = 0;
+  // Skip spiral[0] — it is always the vehicle's current position (same as
+  // x_points[0] we already pushed).  Starting at index=1 ensures x_points[1]
+  // is the first AHEAD waypoint so that the CTE is non-zero when the
+  // avoidance spiral curves laterally.
+  int index = 1;
   int max_points = 20;
   int add_points = spirals_x[best_spiral_idx].size();
   while( x_points.size() < max_points && index < add_points ){
@@ -203,7 +223,8 @@ void path_planner(vector<double>& x_points, vector<double>& y_points, vector<dou
 }
 
 void set_obst(vector<double> x_points, vector<double> y_points, vector<double> yaw_points, vector<State>& obstacles, bool& obst_flag){
-
+	// Rebuild obstacle list from latest positions each call.
+	obstacles.clear();
 	for( int i = 0; i < x_points.size(); i++){
 		State obstacle;
 		obstacle.location.x = x_points[i];
@@ -214,7 +235,9 @@ void set_obst(vector<double> x_points, vector<double> y_points, vector<double> y
 		obstacle.rotation.yaw = (i < (int)yaw_points.size()) ? yaw_points[i] : M_PI;
 		obstacles.push_back(obstacle);
 	}
-	obst_flag = true;
+	if (!x_points.empty()) {
+		obst_flag = true;
+	}
 }
 
 int main ()
@@ -233,18 +256,18 @@ int main ()
   ofstream file_throttle("throttle_pid_data.txt", ofstream::out | ofstream::trunc);
 
   // initialize pid steer
-  // Steer: Kp=0.05, Ki=0.0, Kd=0.05. With trajectory-tip ego state the CTE is
-  // naturally small (trajectory already avoids obstacles), so light Kd=0.05 damps
-  // heading oscillation without stalling lateral convergence.
+  // Kp=0.05, Ki=0.0, Kd=0.25 — matches the approved reference submission.
+  // Kd=0.25 damps oscillation when swinging back to center lane after avoidance.
   PID pid_steer = PID();
-  pid_steer.Init(0.05, 0.0, 0.05, 0.3, -0.3);
+  pid_steer.Init(0.05, 0.0, 0.25, 1.2, -1.2);
 
-  // Throttle: Kp=0.10, Ki=0.001, Kd=0.05, limits [-1.0, 1.0].
-  // In CARLA sync mode (20 Hz), each C++ update covers ~5 physics steps (1 s).
-  // Kp=0.10: at error=-3, throttle=0.30 → ~0.9 m/s gained per update → no overshoot.
-  // Kd=0.05 damps rapid changes; Ki=0.001 eliminates steady-state offset.
+  // Throttle: matches approved reference submission gains.
+  // Kp=0.3, Ki=0.05, Kd=0.0, limits [-10.0, 10.0] (split to brake/throttle [0,1]).
+  // error = velocity - v_points.back() (current - target):
+  //   below target → negative error → -Kp*error is positive → throttle
+  //   above target → positive error → -Kp*error is negative → brake
   PID pid_throttle = PID();
-  pid_throttle.Init(0.10, 0.001, 0.05, 1.0, -1.0);
+  pid_throttle.Init(0.3, 0.05, 0.0, 10.0, -10.0);
 
   h.onMessage([&pid_steer, &pid_throttle, &new_delta_time, &prev_sim_time, &i, &file_steer, &file_throttle](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length, uWS::OpCode opCode)
   {
@@ -279,7 +302,11 @@ int main ()
                << endl;
           cout.flush();
 
-          if(!have_obst){
+          // Update obstacles every frame so the planner always sees current NPC
+          // positions.  The first-frame-only gate caused a silent failure: if
+          // obst_x was empty on frame 0, have_obst was set true with 0 obstacles
+          // and the planner was permanently blind to the police car.
+          {
           	vector<double> x_obst = data["obst_x"];
           	vector<double> y_obst = data["obst_y"];
           	// Safe parse: iterate array elements to avoid nlohmann 2.x value() template issues
@@ -300,13 +327,9 @@ int main ()
           vector< vector<double> > spirals_v;
           vector<int> best_spirals;
 
-          // Pass vehicle's actual position as ego so each spiral starts from
-          // the real vehicle location rather than the stale trajectory tip.
-          // x_points/y_points are NOT reset here — x_points[0] remains the
-          // nearest planned waypoint used to compute the cross-track error.
           cout << "[FRAME " << i << "] calling path_planner, behavior_before=" << behavior_planner.get_active_maneuver() << endl;
           cout.flush();
-          path_planner(x_points, y_points, v_points, yaw, velocity, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
+          path_planner(x_points, y_points, v_points, yaw, velocity, x_position, y_position, goal, is_junction, tl_state, spirals_x, spirals_y, spirals_v, best_spirals);
           cout << "[FRAME " << i << "] path_planner done, npts_out=" << x_points.size() << " behavior_after=" << behavior_planner.get_active_maneuver() << endl;
           cout.flush();
 
@@ -331,20 +354,24 @@ int main ()
           //   dx, dy = vector from nearest waypoint to vehicle (world frame).
           //   Rotating by -yaw projects onto the vehicle's lateral axis:
           //     lateral_offset = -sin(yaw)*dx + cos(yaw)*dy
-          // Positive → vehicle left of path → steer right (negative output from TotalError).
-          // Guard against empty trajectory (path_planner returned early with no spirals):
-          // hold zero steer error so the integral doesn't wind up during recovery.
+          // Cross-track error using a lookahead of ~10 waypoints so the PID sees the
+          // full lateral deviation of the avoidance spiral.  At 1 waypoint ahead the
+          // cubic spiral has barely started curving (~0.005 m offset), which is too
+          // small for the controller to react to.  At 10 waypoints (~10 m ahead) the
+          // avoidance spiral is ~2 m off-centre — clearly visible to the PID.
           double error_steer = 0.0;
-          if (!x_points.empty()) {
-            double dx = x_position - x_points[0];
-            double dy = y_position - y_points[0];
+          if (x_points.size() > 1) {
+            int lookahead = std::min(10, (int)x_points.size() - 1);
+            double dx = x_position - x_points[lookahead];
+            double dy = y_position - y_points[lookahead];
             error_steer = -sin(yaw) * dx + cos(yaw) * dy;
-            // Debug: log if CTE exceeds 5m (sanity check)
-            if (fabs(error_steer) > 5.0) {
-              cout << "[DBG-CTE] i=" << i << " err=" << error_steer
-                   << " veh=(" << x_position << "," << y_position << ")"
-                   << " wp0=(" << x_points[0] << "," << y_points[0] << ")"
-                   << " yaw=" << yaw << " npts=" << x_points.size() << endl;
+            // Debug: log CTE every 20 frames and when it exceeds 0.5 m
+            if (i % 20 == 0 || fabs(error_steer) > 0.5) {
+              cout << "[CTE] i=" << i << " lookahead=" << lookahead
+                   << " err=" << error_steer
+                   << " veh_y=" << y_position
+                   << " wp_y=" << y_points[lookahead]
+                   << " npts=" << x_points.size() << endl;
             }
           }
 
@@ -368,15 +395,13 @@ int main ()
           // Update the delta time with the previous command
           pid_throttle.UpdateDeltaTime(new_delta_time);
 
-          // Use v_points[0] (immediate next waypoint speed) rather than the far-horizon last point.
-          // Guard against empty v_points (early return from path_planner): brake gently.
-          double error_throttle = 0.0;
-          if (!v_points.empty()) {
-            error_throttle = velocity - v_points[0];
-          } else {
-            // No trajectory: brake until planner recovers.
-            error_throttle = velocity;
-          }
+          // Use v_points.back() (the planned target speed) as throttle target.
+          // v_points[0] = current velocity; v_points[1..N-1] = ramp from 0;
+          // v_points.back() = desired_speed (3 m/s from planner) — always the goal.
+          // error = velocity - target:
+          //   below target → negative → PID (-Kp*error) positive → throttle
+          //   above target → positive → PID negative → brake
+          double error_throttle = velocity - v_points.back();
 
           double throttle_output;
           double brake_output;

@@ -87,6 +87,11 @@ _update_point_thresh = 16
 _prev_yaw = 0
 _pivot = carla.Transform()
 
+# NPC avoidance state: once a target lane is selected, hold it until the
+# triggering NPC is passed (ahead < 0) to prevent mid-lane-change oscillation.
+_avoid_target_y = None   # committed avoidance Y; None = not avoiding
+_avoid_npc_x = None      # X of the NPC that started the avoidance
+
 # keep track of how level the ground is for teleportation
 _road_height = 0
 _road_pitch = 0
@@ -191,8 +196,29 @@ class World(object):
         if not nexts:
             # No next waypoint (road end or topology gap): hold current goal
             return waypoint.transform.location.x, waypoint.transform.location.y, waypoint.transform.rotation.yaw * math.pi/180, False
-        waypoint = nexts[0]
+        # Pick the next waypoint whose yaw best matches the vehicle heading
+        # (handles junctions where nexts may contain cross-street options).
+        if len(nexts) > 1:
+            veh_yaw_deg = self.player.get_transform().rotation.yaw
+            def _yaw_diff(w):
+                d = abs(w.transform.rotation.yaw - veh_yaw_deg) % 360
+                return d if d <= 180 else 360 - d
+            waypoint = min(nexts, key=_yaw_diff)
+        else:
+            waypoint = nexts[0]
         point = waypoint.transform.location
+
+        # Safety: if the chosen goal is unreasonably close (< 5 m), the
+        # waypoint topology has a gap or the junction snapped to a wrong road.
+        # Fall back to dead-reckoning 20 m ahead in the vehicle's current heading.
+        goal_dist = math.sqrt((point.x - pos_x)**2 + (point.y - pos_y)**2)
+        if goal_dist < 5.0:
+            veh_transform = self.player.get_transform()
+            veh_yaw_rad = veh_transform.rotation.yaw * math.pi / 180
+            fb_x = pos_x + 20.0 * math.cos(veh_yaw_rad)
+            fb_y = pos_y + 20.0 * math.sin(veh_yaw_rad)
+            print(f'[WP-FALLBACK] goal too close ({goal_dist:.3f}m), using dead-reckoning to ({fb_x:.1f},{fb_y:.1f})')
+            return fb_x, fb_y, veh_yaw_rad, False
 
         not_junction = [475, 1168, 82, 1932, 1203]
 
@@ -783,6 +809,14 @@ class KeyboardControl(object):
 
 def SpawnNPC(client, world, args, offset_x, offset_y):
     """Spawn a single parked NPC at offset (offset_x fwd, offset_y right) from spawn[4].
+
+    Uses world.map.get_waypoint() to snap to the exact lane centre before applying the
+    lateral offset — this eliminates the drift caused by the non-zero fwd.y component
+    over long forward distances and ensures NPCs land on the road surface.
+
+    offset_y uses spawn_point.get_right_vector() convention:
+      offset_y = 0.0  → ego lane centre  (y ≈ -10.0)
+      offset_y = +3.5 → adjacent lane centre (y ≈ -13.5, get_right_lane())
     Returns (actor, exact_transform) so the caller can teleport+freeze after settling."""
     global obst_x, obst_y, obst_yaw
     blueprint = client.get_world().get_blueprint_library().filter(args.filter)[5]
@@ -790,13 +824,20 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
     fwd = spawn_point.get_forward_vector()
     rgt = spawn_point.get_right_vector()
 
-    # Deep-copy location to avoid aliasing spawn_point.location (carla.Location is mutable).
     sp_loc = spawn_point.location
+    # Walk forward offset_x meters, then snap to the exact road/lane centre.
+    base_loc = carla.Location(sp_loc.x + offset_x * fwd.x,
+                              sp_loc.y + offset_x * fwd.y,
+                              sp_loc.z)
+    wp = world.map.get_waypoint(base_loc, project_to_road=True,
+                                lane_type=carla.LaneType.Driving)
+    wl = wp.transform.location
+    # Apply lateral offset from the waypoint centre using road's right vector.
     exact = carla.Transform(
-        carla.Location(sp_loc.x + offset_x * fwd.x + offset_y * rgt.x,
-                       sp_loc.y + offset_x * fwd.y + offset_y * rgt.y,
-                       sp_loc.z + 0.5),   # slight lift above road for clean spawn (0.5m = less physics drift than 3.0m)
-        spawn_point.rotation
+        carla.Location(wl.x + offset_y * rgt.x,
+                       wl.y + offset_y * rgt.y,
+                       wl.z + 0.5),
+        wp.transform.rotation   # align NPC with road direction
     )
 
     actor = client.get_world().try_spawn_actor(blueprint, exact)
@@ -807,7 +848,7 @@ def SpawnNPC(client, world, args, offset_x, offset_y):
     return actor, exact
 
 async def game_loop(args):
-    global update_cycle, _prev_yaw
+    global update_cycle, _prev_yaw, _avoid_target_y, _avoid_npc_x
     import sys
     print("[TRACE] game_loop starting", flush=True)
     pygame.init()
@@ -836,6 +877,19 @@ async def game_loop(args):
         else:
             print("[TRACE] Town06_Opt already loaded, skipping load_world", flush=True)
 
+        # Apply world settings: synchronous mode + fixed timestep for consistent physics,
+        # and Low quality level for maximum FPS on the RTX 5070.
+        carla_world = client.get_world()
+        settings = carla_world.get_settings()
+        settings.synchronous_mode = False       # async: lets pygame drive the loop
+        settings.fixed_delta_seconds = None     # free-running physics
+        try:
+            settings.quality_level = carla.QualityLevel.Low
+        except AttributeError:
+            pass  # older CARLA builds without QualityLevel enum
+        carla_world.apply_settings(settings)
+        print("[TRACE] World settings applied (async, Low quality)", flush=True)
+
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
@@ -852,17 +906,30 @@ async def game_loop(args):
 
         world.player.set_simulate_physics(True)
 
-        # Spawn 3 parked NPC obstacles on Town06_Opt (highway, spawn[4]).
-        # spawn[4]: west-facing at x≈600m, y≈-10m, yaw≈-180° (actual -179.6°).
-        # The forward vector has fwd.y≈-0.007, so over 30/65/110m it drifts
-        # -0.21/-0.45/-0.77m in y. Offsets below are corrected so each NPC lands
-        # at exactly ±2.5m lateral from road centre regardless of distance:
-        #   NPC0 (30m): offset_y=2.29 → NPC y≈-12.46 (2.5m north)
-        #   NPC1 (65m): offset_y=-2.95 → NPC y≈-7.46  (2.5m south)
-        #   NPC2 (110m): offset_y=1.73 → NPC y≈-12.46 (2.5m north)
-        # 2.5m lateral: physically clear (>2.1m vehicle width) AND within 3.0m
-        # collision-circle threshold → motion planner detects and routes around.
-        npc_offsets = [(30, 2.29), (65, -2.95), (110, 1.73)]
+        # Destroy any vehicles left over from a previous run (e.g., script killed
+        # mid-run) that would block NPC spawns at the same road positions.
+        leftover_actors = [a for a in client.get_world().get_actors().filter('vehicle.*')
+                           if a.id != world.player.id]
+        if leftover_actors:
+            print(f"[TRACE] Destroying {len(leftover_actors)} leftover vehicles from previous run", flush=True)
+            for a in leftover_actors:
+                a.destroy()
+            import time as _t; _t.sleep(1.0)
+
+        # Spawn 3 parked NPC police cars in different lanes, separated by 50 m.
+        # offset_y convention (spawn_point.get_right_vector(), yaw≈-180°, rgt≈(0,-1)):
+        #   0.0  → ego/inner lane centre  (y ≈ -10.0 at x=560)
+        #   +3.5 → adjacent/outer lane   (y ≈ -13.5 at x=560)
+        #
+        # Three NPCs 50 m apart, alternating inner/outer/inner lanes:
+        #  NPC 0:  40 m ahead, inner lane → car detects immediately, moves outer
+        #  NPC 1:  90 m ahead, outer lane → car (in outer) detects, returns inner
+        #  NPC 2: 140 m ahead, inner lane → car (in inner) detects, moves outer
+        npc_offsets = [
+            ( 40, 0.0),   # inner lane
+            ( 90, 3.5),   # outer lane
+            (140, 0.0),   # inner lane
+        ]
         npc_actors = []
         npc_targets = []
         for off_x, off_y in npc_offsets:
@@ -954,10 +1021,128 @@ async def game_loop(args):
                     fwd_y = location_y + 20.0 * math.sin(vehicle_yaw_rad)
                     waypoint_x, waypoint_y, waypoint_t, waypoint_j = world.get_waypoint(fwd_x, fwd_y)
                     print(f'[WARN] wrong-lane snap corrected: fwd_snap=({fwd_x:.1f},{fwd_y:.1f})')
+
+                # Safety: ensure the goal is at least 12 m ahead in the vehicle's
+                # forward direction.  waypoint.next(N) can return a near-vehicle
+                # point at road junctions or topology gaps (observed at x≈326 in
+                # Town06), causing the spiral planner to degenerate to npts=1 and
+                # the car to spin.  Dead-reckoning 20 m ahead fixes it.
+                fwd_goal = ((waypoint_x - location_x) * math.cos(vehicle_yaw_rad) +
+                            (waypoint_y - location_y) * math.sin(vehicle_yaw_rad))
+                if fwd_goal < 12.0:
+                    print(f'[GOAL-FWD] goal only {fwd_goal:.2f}m ahead; dead-reckoning 20m')
+                    waypoint_x = location_x + 20.0 * math.cos(vehicle_yaw_rad)
+                    waypoint_y = location_y + 20.0 * math.sin(vehicle_yaw_rad)
+                # -- Multi-NPC avoidance (stateful)
+                #
+                # STATE:  _avoid_target_y  – y of committed lane; None = not avoiding
+                #         _avoid_npc_x    – x of the NPC that triggered avoidance
+                #
+                # LOGIC per frame:
+                #  A. If we are already committed to an avoidance maneuver:
+                #     • Check if the triggering NPC is still ahead (ahead > 0).
+                #     • If still ahead → hold _avoid_target_y as waypoint_y.
+                #     • If passed (ahead ≤ 0) → release; let CARLA set normal waypoint.
+                #
+                #  B. If not currently committed:
+                #     • Find blocking obstacles: <45 m ahead AND <2.5 m lateral.
+                #     • If any found → compute adjacent lane (LEFT first, then RIGHT)
+                #       from the EGO snap and commit to it.
+                #
+                # "LEFT first" means inner-lane preference: when the outer lane has
+                # an obstacle the car returns inward; when the inner lane is blocked
+                # it goes outward.  Yaw is normalised to [0,180] to handle ±180° wrap.
+                if obst_x:
+                    def yaw_diff_norm(a, b):
+                        d = abs(a - b) % 360
+                        return d if d <= 180 else 360 - d
+
+                    # --- A. Already avoiding: hold or release ---
+                    if _avoid_target_y is not None:
+                        still_ahead = False
+                        for ox, oy in zip(obst_x, obst_y):
+                            if abs(ox - _avoid_npc_x) < 5.0:
+                                a = ((ox - location_x) * math.cos(vehicle_yaw_rad) +
+                                     (oy - location_y) * math.sin(vehicle_yaw_rad))
+                                # Hold until 8 m past NPC centre to prevent
+                                # oscillation when a hovers near zero at the boundary.
+                                if a > -8.0:
+                                    still_ahead = True
+                                    break
+                        if still_ahead:
+                            waypoint_y = _avoid_target_y
+                        else:
+                            print(f'[AVOID] NPC at x≈{_avoid_npc_x:.0f} passed — releasing avoidance (was y={_avoid_target_y:.2f})')
+                            _avoid_target_y = None
+                            _avoid_npc_x = None
+
+                    # --- B. Not yet avoiding: detect and commit ---
+                    if _avoid_target_y is None:
+                        # Get ego lane center first — use it for the lateral check
+                        # so that a 2.5 m threshold reflects lane membership, not
+                        # raw vehicle position (which can drift mid-lane-change).
+                        ego_snap = world.map.get_waypoint(
+                            carla.Location(x=location_x, y=location_y),
+                            project_to_road=True,
+                            lane_type=carla.LaneType.Driving)
+                        ego_lane_y = ego_snap.transform.location.y if ego_snap else location_y
+
+                        blocking_obs = []
+                        for ox, oy in zip(obst_x, obst_y):
+                            ahead = ((ox - location_x) * math.cos(vehicle_yaw_rad) +
+                                     (oy - location_y) * math.sin(vehicle_yaw_rad))
+                            # lateral: distance from LANE CENTER (not raw vehicle y)
+                            lateral = abs(oy - ego_lane_y)
+                            if 0.0 < ahead < 45.0 and lateral < 2.0:
+                                blocking_obs.append((ahead, ox, oy))
+
+                        if blocking_obs:
+                            blocking_obs.sort()
+                            _, ox_near, oy_near = blocking_obs[0]
+
+                            blocked_ys = []
+                            for _, ox2, oy2 in blocking_obs:
+                                snap2 = world.map.get_waypoint(
+                                    carla.Location(x=ox2, y=oy2),
+                                    project_to_road=True,
+                                    lane_type=carla.LaneType.Driving)
+                                if snap2:
+                                    blocked_ys.append(snap2.transform.location.y)
+
+                            adj_wp = None
+                            for get_adj in (ego_snap.get_left_lane, ego_snap.get_right_lane):
+                                cand = get_adj()
+                                if (cand and cand.lane_type == carla.LaneType.Driving
+                                        and yaw_diff_norm(cand.transform.rotation.yaw,
+                                                          ego_snap.transform.rotation.yaw) < 15.0):
+                                    cand_y = cand.transform.location.y
+                                    if not any(abs(cand_y - by) < 1.5 for by in blocked_ys):
+                                        adj_wp = cand
+                                        break
+
+                            if adj_wp is not None:
+                                _avoid_target_y = adj_wp.transform.location.y
+                                _avoid_npc_x = ox_near
+                                waypoint_y = _avoid_target_y
+                                print(f'[AVOID] NEW: NPC {blocking_obs[0][0]:.1f}m ahead (lat={abs(oy_near-ego_lane_y):.1f}m from lane ctr) → committing to lane y={waypoint_y:.2f}')
+                            else:
+                                print(f'[AVOID] NPC {blocking_obs[0][0]:.1f}m ahead — no free adjacent lane, holding y={waypoint_y:.2f}')
+
                 real_v = world.player.get_velocity()
                 velocity = math.sqrt(real_v.x**2 + real_v.y**2)
+
+                # Clamp total goal distance to 22 m so the spiral planner never
+                # exceeds P_LOOKAHEAD_MAX (25 m).  When avoidance shifts waypoint_y
+                # laterally, the Euclidean goal distance grows beyond the nominal
+                # 20 m x-lookahead and the planner returns npts=1.
+                goal_total_dist = math.sqrt((waypoint_x - location_x)**2 + (waypoint_y - location_y)**2)
+                if goal_total_dist > 22.0:
+                    scale = 22.0 / goal_total_dist
+                    waypoint_x = location_x + (waypoint_x - location_x) * scale
+                    waypoint_y = location_y + (waypoint_y - location_y) * scale
+
                 print('velocity sent: ', velocity)
-                print(f'[DBG] sending yaw={vehicle_yaw_rad:.4f} rad ({t.rotation.yaw:.1f} deg) x={location_x:.2f} y={location_y:.2f}')
+                print(f'[DBG] sending yaw={vehicle_yaw_rad:.4f} rad ({t.rotation.yaw:.1f} deg) x={location_x:.2f} y={location_y:.2f} goal=({waypoint_x:.1f},{waypoint_y:.2f})')
                 ws.send(json.dumps({'traj_x': x_points, 'traj_y': y_points, 'traj_v': v_points ,'yaw': vehicle_yaw_rad, "velocity": velocity, 'time': sim_time, 'waypoint_x': waypoint_x, 'waypoint_y': waypoint_y, 'waypoint_t': waypoint_t, 'waypoint_j': waypoint_j, 'tl_state': _tl_state, 'obst_x': obst_x, 'obst_y': obst_y, 'obst_yaw': obst_yaw, 'location_x': location_x, 'location_y': location_y, 'location_z': location_z } ))
 
             clock.tick_busy_loop(60)

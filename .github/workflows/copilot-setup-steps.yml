@@ -1,0 +1,91 @@
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # System dependencies
+      # -----------------------------------------------------------------------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libssl-dev \
+            libz-dev \
+            libuv1-dev \
+            libboost-all-dev \
+            libgoogle-glog-dev \
+            libgtest-dev \
+            liblapack-dev \
+            gnuplot \
+            python3-pip
+
+      # -----------------------------------------------------------------------
+      # uWebSockets (pinned to the same commit used in install-ubuntu.sh)
+      # -----------------------------------------------------------------------
+      - name: Build and install uWebSockets
+        run: |
+          git clone https://github.com/uWebSockets/uWebSockets
+          cd uWebSockets
+          git checkout e94b6e1
+          mkdir build && cd build
+          cmake ..
+          make
+          sudo make install
+          cd ../..
+          rm -rf uWebSockets
+          sudo ln -sf /usr/local/lib/libuWS.so /usr/lib/libuWS.so || true
+
+      # -----------------------------------------------------------------------
+      # Build GTest (apt installs sources only, not prebuilt libraries)
+      # -----------------------------------------------------------------------
+      - name: Build GTest
+        run: |
+          cd /usr/src/gtest
+          sudo cmake .
+          sudo make
+          sudo cp lib/*.a /usr/local/lib/ 2>/dev/null || \
+          sudo cp *.a /usr/local/lib/ 2>/dev/null || true
+
+      # -----------------------------------------------------------------------
+      # Minimal CARLA RPC stub (librpc.a expected by CMakeLists.txt).
+      # Runtime communication is WebSocket-only via simulatorAPI.py;
+      # only the static archive target needs to exist at link time.
+      # -----------------------------------------------------------------------
+      - name: Create CARLA RPC stub library
+        run: |
+          CARLA_LIB_DIR=project/CARLA/CarlaUE4/Plugins/Carla/CarlaDependencies/lib
+          mkdir -p "$CARLA_LIB_DIR"
+          ar rcs "$CARLA_LIB_DIR/librpc.a"
+
+      # -----------------------------------------------------------------------
+      # Python dependencies (plot_pid.py, twiddle_tune.py, simulatorAPI.py)
+      # -----------------------------------------------------------------------
+      - name: Install Python dependencies
+        run: pip3 install --upgrade pip numpy matplotlib pandas
+
+      # -----------------------------------------------------------------------
+      # Build the PID controller
+      # -----------------------------------------------------------------------
+      - name: Build pid_controller
+        working-directory: project/pid_controller
+        run: |
+          cmake .
+          make -j$(nproc)
+
+      # -----------------------------------------------------------------------
+      # Run unit tests
+      # -----------------------------------------------------------------------
+      - name: Run PID unit tests
+        working-directory: project/pid_controller
+        run: ./tests/pid_test

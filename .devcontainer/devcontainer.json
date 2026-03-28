@@ -1,0 +1,44 @@
+{
+  "name": "SDC C6 – PID Controller",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Forward the uWS port used by main.cpp ↔ simulatorAPI.py
+  "forwardPorts": [4567],
+  "portsAttributes": {
+    "4567": { "label": "PID WebSocket" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-python.python",
+        "ms-python.debugpy",
+        "twxs.cmake"
+      ],
+      "settings": {
+        "C_Cpp.default.cppStandard": "c++17",
+        "C_Cpp.default.compilerPath": "/usr/bin/g++",
+        "C_Cpp.default.includePath": [
+          "${workspaceFolder}/project/pid_controller",
+          "${workspaceFolder}/project/pid_controller/eigen-3.3.7",
+          "/usr/include"
+        ],
+        "cmake.sourceDirectory": "${workspaceFolder}/project/pid_controller",
+        "cmake.buildDirectory": "${workspaceFolder}/project/pid_controller",
+        "editor.formatOnSave": true,
+        "python.defaultInterpreterPath": "/usr/bin/python3"
+      }
+    }
+  },
+
+  // Build the project and create the CARLA RPC stub after the container starts
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "remoteUser": "vscode"
+}

@@ -15,9 +15,9 @@
 // Planning Constants
 #define P_NUM_PATHS 7
 #define P_LOOKAHEAD_MIN 8.0            // m
-#define P_LOOKAHEAD_MAX 20.0           // m
+#define P_LOOKAHEAD_MAX 25.0           // m  (was 20 — avoidance adds ~4m lateral, pushing total dist > 20m)
 #define P_LOOKAHEAD_TIME 1.5           // s
-#define P_GOAL_OFFSET 1.0              // m
+#define P_GOAL_OFFSET 1.5              // m  (wider spiral fan → adjacent lane at ±4.5 m)
 #define P_ERR_TOLERANCE 0.1            // m
 #define P_TIME_GAP 1.0                 // s
 #define P_MAX_ACCEL 1.5                // m/s^2
@@ -33,7 +33,7 @@
   P_LOOKAHEAD_MIN / P_NUM_POINTS_IN_SPIRAL * 2  // m
 
 constexpr std::array<float, 3> CIRCLE_OFFSETS = {-1.0, 1.0, 3.0};  // m
-constexpr std::array<float, 3> CIRCLE_RADII = {1.5, 1.5, 1.5};     // m
+constexpr std::array<float, 3> CIRCLE_RADII = {1.0, 1.0, 1.0};     // m  (was 1.5 — adjacent-lane NPC lateral gap ~2.9m < 3.0m threshold → npts=1)
 
 constexpr double dt = 0.05;
 // Standard devaition parameters for x, x_dot, x_double_dot

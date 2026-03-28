@@ -4,21 +4,12 @@ test_lane_change_pid.py
 AV QA Engineer — Obstacle-Triggered EMERGENCY Lane-Change PID Stability Test
 
 Scene (Town03):
-  Ego spawned near (x=-10, y=140, z=2), snapped to road centre via CARLA
-  waypoint API.
-  Stationary police car (vehicle.dodge.charger_police) placed exactly 20 m
-  ahead in the SAME lane using waypoint.next(20.0) — guaranteed centred and
-  DIRECTLY in the ego's path.
-
-  Why 20 m?  At ~4.6 m/s the car would hit the police car in ≈4.3 s without
-  intervention.  This is a genuine collision scenario, not a planned merge.
-
-  At 15 m distance the lane-change fires (≈3.3 s before impact at cruise
-  speed).  The PID must swerve the car into the adjacent left lane in time.
-
-  Expected near-miss: when the ego's x-position equals the police car's
-  x-position (~3.3 s post-trigger), the car has moved ≈3.1 m laterally —
-  a centre-to-centre clearance of ≈3.1 m.  Safe but close.
+  Ego spawned at spawn_points[42] = (x≈-9.9, y≈70.1) — road=30, lane=-2.
+  This spawn was selected because road=30 has NO road/lane transitions for
+  30 m ahead (confirmed via CARLA waypoint API geometry probe).
+  The original user-specified (y=140) spawn was only 10 m from a junction;
+  waypoint.next(20) landed on road=1031 (junction connecting road) where
+  lane markings dissolve, causing the police car to appear "between lanes."
 
 PID gains (exact mirror of main.cpp, never diverge):
   Steering  : Kp=0.05  Ki=0.00  Kd=0.05  clamp=[−0.3, +0.3]
@@ -74,13 +65,17 @@ CARLA_HOST     = "localhost"
 CARLA_PORT     = 2000
 SYNC_DELTA     = 0.05              # s — deterministic physics tick
 
-MAP_NAME       = "Town03"
-# User-specified spawn; snapped to road centre automatically.
-EGO_SPAWN_LOC  = carla.Location(x=-10.0, y=140.0, z=2.0)
+MAP_NAME          = "Town03"
+# spawn[42] = (x=-9.9, y=70.1) — same x-column as user's original (x=-10), but on a
+# straight section of road=30 with NO road transitions for 30 m ahead.
+# The original (y=140) spawn was only 10 m from a junction; the police car at 20 m
+# landed inside junction road=1031 where lane markings dissolve ("between lanes").
+SPAWN_POINT_IDX   = 42
 
-POLICE_DIST_M  = 20.0             # m — police car ahead: close enough to be on collision course
-TRIGGER_DIST_M = 15.0             # m — emergency trigger (~3.3 s before impact at cruise speed)
-LOOKAHEAD_M    = 10.0             # m — waypoint look-ahead for CTE
+POLICE_DIST_M     = 40.0             # m — police car ahead: far enough that lane change
+                                     #     completes before ego reaches police y-position
+TRIGGER_DIST_M    = 25.0             # m — emergency trigger (~6 s before impact at 4 m/s)
+LOOKAHEAD_M       = 10.0             # m — waypoint look-ahead for CTE
 
 TARGET_SPEED   = 30.0 / 3.6      # 8.33 m/s = 30 km/h
 
@@ -212,45 +207,39 @@ def test_lane_change_pid() -> Result:
         world.apply_settings(settings)
         log.info("Sync mode ON  dt=%.3f s", SYNC_DELTA)
 
-        # ── Snap EGO_SPAWN_LOC to road centre ────────────────────────────────
+        # ── Spawn ego from pre-validated spawn point ─────────────────────────
+        # spawn[42] = (x≈-9.9, y≈70.1): road=30 lane=-2, no road transitions
+        # for 30 m ahead — confirmed via CARLA waypoint API geometry probe.
+        spawn_points = carla_map.get_spawn_points()
+        if SPAWN_POINT_IDX >= len(spawn_points):
+            raise RuntimeError(
+                f"SPAWN_POINT_IDX={SPAWN_POINT_IDX} out of range "
+                f"(map has {len(spawn_points)} spawn points)"
+            )
+        ego_tf = spawn_points[SPAWN_POINT_IDX]
         ego_wp = carla_map.get_waypoint(
-            EGO_SPAWN_LOC, project_to_road=True,
+            ego_tf.location, project_to_road=True,
             lane_type=carla.LaneType.Driving
         )
-        ego_tf = ego_wp.transform
-        ego_tf.location.z += 0.5            # small lift to avoid ground clipping
 
         ego_bp = world.get_blueprint_library().find("vehicle.lincoln.mkz_2017")
         ego_bp.set_attribute("role_name", "ego")
         ego = world.try_spawn_actor(ego_bp, ego_tf)
 
-        # Fallback: search spawn points within 30 m if road snap failed
-        if ego is None:
-            log.warning("Snap spawn failed — scanning nearby spawn points …")
-            for sp in carla_map.get_spawn_points():
-                if dist2d(sp.location, EGO_SPAWN_LOC) < 30.0:
-                    ego = world.try_spawn_actor(ego_bp, sp)
-                    if ego is not None:
-                        log.info("Fallback spawn at x=%.1f y=%.1f",
-                                 sp.location.x, sp.location.y)
-                        ego_wp = carla_map.get_waypoint(
-                            sp.location, project_to_road=True,
-                            lane_type=carla.LaneType.Driving
-                        )
-                        break
-
         if ego is None:
             raise RuntimeError(
-                "Could not spawn ego near (x=-10, y=140, z=2) in Town03. "
-                "Adjust EGO_SPAWN_LOC to a valid road location."
+                f"Could not spawn ego at spawn_points[{SPAWN_POINT_IDX}]. "
+                "Another actor may already occupy that location."
             )
 
         actors.append(ego)
         world.tick()
 
         ego_loc = ego.get_transform().location
-        log.info("Ego spawned at x=%.1f y=%.1f yaw=%.1f°",
-                 ego_loc.x, ego_loc.y, ego.get_transform().rotation.yaw)
+        log.info("Ego spawned at x=%.1f y=%.1f yaw=%.1f°  "
+                 "[road=%d lane=%d]",
+                 ego_loc.x, ego_loc.y, ego.get_transform().rotation.yaw,
+                 ego_wp.road_id, ego_wp.lane_id)
 
         # ── Verify a same-direction left lane exists ─────────────────────────
         left_wp = ego_wp.get_left_lane()
@@ -258,7 +247,6 @@ def test_lane_change_pid() -> Result:
                 or left_wp.lane_type != carla.LaneType.Driving
                 or abs(yaw_diff_deg(left_wp.transform.rotation.yaw,
                                     ego_wp.transform.rotation.yaw)) >= 90.0):
-            # Try 15 m ahead (road might narrow at spawn)
             nxt = ego_wp.next(15.0)
             if nxt:
                 left_wp = nxt[0].get_left_lane()
@@ -268,22 +256,37 @@ def test_lane_change_pid() -> Result:
                 or abs(yaw_diff_deg(left_wp.transform.rotation.yaw,
                                     ego_wp.transform.rotation.yaw)) >= 90.0):
             raise RuntimeError(
-                "SKIP: No same-direction adjacent driving lane at spawn. "
-                "The chosen coordinate is on a single-lane or one-way road. "
-                "Try a different EGO_SPAWN_LOC on a multi-lane section."
+                "No same-direction adjacent driving lane at spawn. "
+                "Change SPAWN_POINT_IDX to a multi-lane section."
             )
 
         log.info("Left lane confirmed — road_id=%d lane_id=%d  yaw=%.1f°",
                  left_wp.road_id, left_wp.lane_id,
                  left_wp.transform.rotation.yaw)
 
-        # ── Police car — 50 m ahead in the SAME lane ────────────────────────
+        # ── Police car — POLICE_DIST_M ahead in the EXACT SAME lane ─────────
         nexts = ego_wp.next(POLICE_DIST_M)
         if not nexts:
-            raise RuntimeError("No waypoint found 50 m ahead of ego spawn.")
+            raise RuntimeError(
+                f"No waypoint found {POLICE_DIST_M} m ahead of ego spawn."
+            )
         police_wp = nexts[0]
+
+        # Hard assertion: must be the same lane as the ego
+        if police_wp.lane_id != ego_wp.lane_id or police_wp.road_id != ego_wp.road_id:
+            raise RuntimeError(
+                f"Police car waypoint is in a DIFFERENT lane/road than the ego! "
+                f"Ego: road={ego_wp.road_id} lane={ego_wp.lane_id}  "
+                f"Police: road={police_wp.road_id} lane={police_wp.lane_id}. "
+                f"The road transitions before {POLICE_DIST_M} m. "
+                f"Reduce POLICE_DIST_M or change SPAWN_POINT_IDX."
+            )
         police_tf = police_wp.transform
-        police_tf.location.z += 0.1        # slight lift to avoid floor clipping
+        police_tf.location.z += 0.1
+
+        log.info("Police car WP: x=%.1f y=%.1f  [road=%d lane=%d]  (%.1f m ahead)",
+                 police_tf.location.x, police_tf.location.y,
+                 police_wp.road_id, police_wp.lane_id, POLICE_DIST_M)
 
         police_bp = world.get_blueprint_library().find(
             "vehicle.dodge.charger_police"
@@ -291,18 +294,23 @@ def test_lane_change_pid() -> Result:
         police_bp.set_attribute("role_name", "police")
         police = world.try_spawn_actor(police_bp, police_tf)
         if police is None:
-            raise RuntimeError("Could not spawn police car 50 m ahead.")
+            raise RuntimeError(
+                f"Could not spawn police car {POLICE_DIST_M} m ahead. "
+                "Try a different spawn point."
+            )
 
-        # Lock it in place
+        # Lock it in place — stationary obstacle
         police.apply_control(carla.VehicleControl(brake=1.0))
         police.set_target_velocity(carla.Vector3D(0, 0, 0))
         actors.append(police)
         world.tick()
 
         actual_police_loc = police.get_transform().location
-        log.info("Police car at x=%.1f y=%.1f (actual dist=%.1f m)",
-                 actual_police_loc.x, actual_police_loc.y,
-                 dist2d(ego_loc, actual_police_loc))
+        actual_dist = dist2d(ego_loc, actual_police_loc)
+        log.info("Police car spawned at x=%.1f y=%.1f  actual dist=%.1f m  "
+                 "[road=%d lane=%d]  ← SAME LANE as ego ✅",
+                 actual_police_loc.x, actual_police_loc.y, actual_dist,
+                 police_wp.road_id, police_wp.lane_id)
 
         # ── PID controllers ──────────────────────────────────────────────────
         steer_pid    = SimplePID(STEER_KP,    STEER_KI,    STEER_KD,
@@ -443,7 +451,7 @@ def test_lane_change_pid() -> Result:
 
         if not triggered:
             failures.append(
-                "TRIGGER: ego never came within 15 m of police car "
+                "TRIGGER: ego never came within 25 m of police car "
                 f"(min dist observed={min_dist:.1f} m)"
             )
 
