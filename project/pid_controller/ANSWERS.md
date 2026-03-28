@@ -37,7 +37,7 @@
 
 The screenshot below shows the Lincoln MKZ spawned at waypoint [4] in Town06_Opt, stationary before the PID controller begins issuing commands:
 
-![Vehicle spawned in CARLA — stationary](../screenshot.png)
+![Vehicle spawned in CARLA — stationary](./screenshot/sreenshot.png)
 
 ---
 
